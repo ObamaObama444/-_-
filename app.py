@@ -214,6 +214,10 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
 
 
 def start_bot_if_configured() -> None:
+    if os.getenv("DISABLE_BOT") == "1":
+        logging.warning("DISABLE_BOT=1 is set. HTTP server will run without Telegram bot.")
+        return
+
     token = os.getenv("BOT_TOKEN")
     webapp_url = os.getenv("WEBAPP_URL")
 

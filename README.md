@@ -1,93 +1,99 @@
 # Райн-ровер Telegram Mini App
 
-Telegram Mini App без Node.js: Python backend отдаёт статический HTML/CSS/JS фронт и запускает Telegram-бота через long polling.
+Python backend + чистый HTML/CSS/JS frontend для Telegram Mini App.
 
-## Стек
+Бот: `https://t.me/RaianRoverYandex_bot`  
+Mini App URL: `https://adolanna.ru`
 
-- Python 3.10+
-- только стандартная библиотека Python
-- HTML + CSS + JavaScript
-
-## Структура
+## Что внутри
 
 ```text
 app.py              # HTTP server + Telegram Bot API long polling
-web/index.html     # Mini App HTML
-web/styles.css     # Figma-like layout and animation
-web/app.js         # screen flow: welcome -> start -> loading -> result
-public/assets/     # локальные ассеты из Figma
-.env.example       # пример переменных окружения
+.env                # готовые переменные для бота и домена
+web/index.html      # HTML
+web/styles.css      # CSS
+web/app.js          # JS flow: welcome -> start -> loading -> result
+public/assets/      # ассеты из Figma
 ```
 
-## Локальный запуск
+Проект не требует Node.js, npm, pip и Docker. Нужен только Python 3.10+.
+
+## Быстрый деплой на ВМ
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python app.py
+cd /opt
+sudo git clone https://github.com/ObamaObama444/-_-.git ryan-rover
+sudo chown -R $USER:$USER /opt/ryan-rover
+cd /opt/ryan-rover
+python3 app.py
 ```
 
-Mini App откроется на `http://localhost:3000`.
-
-Проверка сервера:
+Проверка на самой ВМ:
 
 ```bash
-curl http://localhost:3000/health
+curl http://127.0.0.1:3000/health
 ```
 
-Если `.env` не заполнен, web-сервер всё равно стартует, но бот не запускается.
+Ожидаемо:
 
-## Переменные окружения
+```json
+{"ok": true, "service": "ryan-rover-miniapp", "bot": true}
+```
 
-Создай `.env`:
+## Nginx для adolanna.ru
+
+Если Nginx уже стоит, создай конфиг:
 
 ```bash
-cp .env.example .env
-nano .env
+sudo nano /etc/nginx/sites-available/ryan-rover
 ```
 
-```env
-BOT_TOKEN=123456789:your-telegram-bot-token
-WEBAPP_URL=https://your-domain.example
-PORT=3000
+Вставь:
+
+```nginx
+server {
+    server_name adolanna.ru www.adolanna.ru;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
 ```
 
-`WEBAPP_URL` должен быть публичным HTTPS-адресом. Telegram Mini Apps в продакшене требуют HTTPS.
-
-## Деплой на ВМ без Docker
-
-1. Установи Python 3.10+ и Git.
-
-2. Склонируй репозиторий:
+Включи сайт:
 
 ```bash
-git clone https://github.com/ObamaObama444/-_-.git
-cd -_-
+sudo ln -sf /etc/nginx/sites-available/ryan-rover /etc/nginx/sites-enabled/ryan-rover
+sudo nginx -t
+sudo systemctl reload nginx
 ```
 
-3. Создай виртуальное окружение:
+Включи HTTPS:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+sudo certbot --nginx -d adolanna.ru -d www.adolanna.ru
 ```
 
-4. Заполни `.env`:
+После этого проверь:
 
 ```bash
-cp .env.example .env
-nano .env
-```
-
-5. Запусти приложение:
-
-```bash
-python app.py
+curl https://adolanna.ru/health
 ```
 
 ## Запуск через systemd
 
-Пример `/etc/systemd/system/ryan-rover.service`:
+Создай сервис:
+
+```bash
+sudo nano /etc/systemd/system/ryan-rover.service
+```
+
+Вставь:
 
 ```ini
 [Unit]
@@ -96,8 +102,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/path/to/-_-
-ExecStart=/path/to/-_-/.venv/bin/python /path/to/-_-/app.py
+WorkingDirectory=/opt/ryan-rover
+ExecStart=/usr/bin/python3 /opt/ryan-rover/app.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -106,27 +112,32 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 ```
 
-Команды:
+Запусти:
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable ryan-rover
-sudo systemctl start ryan-rover
+sudo systemctl restart ryan-rover
 sudo systemctl status ryan-rover
 ```
 
-После обновления кода:
+Логи:
 
 ```bash
+journalctl -u ryan-rover -f
+```
+
+## Обновление
+
+```bash
+cd /opt/ryan-rover
 git pull
-source .venv/bin/activate
 sudo systemctl restart ryan-rover
 ```
 
-## Telegram BotFather
+## Как проверить в Telegram
 
-1. Создай бота через `@BotFather`.
-2. Запиши токен в `BOT_TOKEN`.
-3. Укажи публичный HTTPS-домен в `WEBAPP_URL`.
-4. Запусти `python app.py`.
-5. Напиши боту `/start`: он пришлёт кнопку Mini App и установит кнопку меню.
+1. Открой `https://t.me/RaianRoverYandex_bot`.
+2. Напиши `/start`.
+3. Нажми кнопку `Открыть Райн-ровер`.
+4. Если меню Telegram уже обновилось, можно открыть Mini App через кнопку меню бота.
