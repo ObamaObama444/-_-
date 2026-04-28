@@ -8,12 +8,15 @@ Mini App URL: `https://www.adolanna.ru`
 ## Что внутри
 
 ```text
-app.py              # HTTP server + Telegram Bot API long polling
-.env                # готовые переменные для бота и домена
-web/index.html      # HTML
-web/styles.css      # CSS
-web/app.js          # JS flow: welcome -> start -> loading -> result
-public/assets/      # ассеты из Figma
+app.py                    # HTTP server + Telegram Bot API long polling
+.env.example              # пример переменных без секретов
+deploy/nginx.conf         # nginx reverse proxy для домена
+deploy/ryan-rover.service # systemd unit
+scripts/deploy-vps.sh     # установка/обновление на Ubuntu VPS
+web/index.html            # HTML
+web/styles.css            # CSS
+web/app.js                # JS flow: welcome -> start -> loading -> result
+public/assets/            # ассеты из Figma
 ```
 
 Проект не требует Node.js, npm, pip и Docker. Нужен только Python 3.10+.
@@ -21,17 +24,15 @@ public/assets/      # ассеты из Figma
 ## Быстрый деплой на ВМ
 
 ```bash
-cd /opt
-sudo git clone https://github.com/ObamaObama444/-_-.git ryan-rover
-sudo chown -R $USER:$USER /opt/ryan-rover
-cd /opt/ryan-rover
-python3 app.py
+curl -fsSL https://raw.githubusercontent.com/ObamaObama444/-_-/codex/deploy-bot-test/scripts/deploy-vps.sh -o /tmp/deploy-vps.sh
+sudo BOT_TOKEN="telegram-bot-token" bash /tmp/deploy-vps.sh
 ```
 
 Проверка на самой ВМ:
 
 ```bash
 curl http://127.0.0.1:3000/health
+curl http://127.0.0.1:3000/ready
 ```
 
 Ожидаемо:
@@ -40,100 +41,24 @@ curl http://127.0.0.1:3000/health
 {"ok": true, "service": "ryan-rover-miniapp", "bot": true}
 ```
 
-## Nginx для adolanna.ru
-
-Если Nginx уже стоит, создай конфиг:
-
-```bash
-sudo nano /etc/nginx/sites-available/ryan-rover
-```
-
-Вставь:
-
-```nginx
-server {
-    server_name adolanna.ru www.adolanna.ru;
-
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
-Включи сайт:
-
-```bash
-sudo ln -sf /etc/nginx/sites-available/ryan-rover /etc/nginx/sites-enabled/ryan-rover
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-Включи HTTPS:
-
-```bash
-sudo certbot --nginx -d adolanna.ru -d www.adolanna.ru
-```
-
-После этого проверь:
-
-```bash
-curl https://www.adolanna.ru/health
-```
-
-## Запуск через systemd
-
-Создай сервис:
-
-```bash
-sudo nano /etc/systemd/system/ryan-rover.service
-```
-
-Вставь:
-
-```ini
-[Unit]
-Description=Ryan Rover Telegram Mini App
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/ryan-rover
-ExecStart=/usr/bin/python3 /opt/ryan-rover/app.py
-Restart=always
-RestartSec=5
-Environment=PYTHONUNBUFFERED=1
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Запусти:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable ryan-rover
-sudo systemctl restart ryan-rover
-sudo systemctl status ryan-rover
-```
-
-Логи:
-
-```bash
-journalctl -u ryan-rover -f
-```
-
-## Обновление
+## Обновление на ВМ
 
 ```bash
 cd /opt/ryan-rover
-git pull
-sudo systemctl restart ryan-rover
+sudo BRANCH=codex/deploy-bot-test BOT_TOKEN="telegram-bot-token" bash scripts/deploy-vps.sh
 ```
+
+Скрипт ставит `git`, `nginx`, `python3`, создает `/etc/ryan-rover/ryan-rover.env`, устанавливает `systemd` сервис и nginx proxy для `adolanna.ru` / `www.adolanna.ru`.
+
+HTTPS включается после того, как DNS домена указывает на сервер:
+
+```bash
+sudo apt-get install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d adolanna.ru -d www.adolanna.ru
+curl https://www.adolanna.ru/health
+```
+
+Логи бота: `journalctl -u ryan-rover -f`
 
 ## Как проверить в Telegram
 

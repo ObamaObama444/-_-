@@ -150,11 +150,19 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self.send_health()
             return
 
+        if self.path == "/ready":
+            self.send_ready()
+            return
+
         self.serve_file_for_path()
 
     def do_HEAD(self) -> None:
         if self.path == "/health":
             self.send_health(head_only=True)
+            return
+
+        if self.path == "/ready":
+            self.send_ready(head_only=True)
             return
 
         self.serve_file_for_path(head_only=True)
@@ -170,6 +178,18 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
         ).encode("utf-8")
 
         self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+
+        if not head_only:
+            self.wfile.write(body)
+
+    def send_ready(self, head_only: bool = False) -> None:
+        ready = bool(os.getenv("BOT_TOKEN") and os.getenv("WEBAPP_URL"))
+        body = json.dumps({"ok": ready}, ensure_ascii=False).encode("utf-8")
+
+        self.send_response(HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -233,11 +253,12 @@ def main() -> None:
     load_env()
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(levelname)s:%(message)s")
 
+    host = os.getenv("HOST", "0.0.0.0")
     port = env_int("PORT", 3000)
     start_bot_if_configured()
 
-    server = ThreadingHTTPServer(("0.0.0.0", port), MiniAppHandler)
-    logging.info("HTTP server is listening on http://0.0.0.0:%s", port)
+    server = ThreadingHTTPServer((host, port), MiniAppHandler)
+    logging.info("HTTP server is listening on http://%s:%s", host, port)
     server.serve_forever()
 
 

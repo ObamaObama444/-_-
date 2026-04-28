@@ -1,0 +1,18 @@
+[Unit]
+Description=Ryan Rover Telegram Mini App
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/ryan-rover
+EnvironmentFile=/etc/ryan-rover/ryan-rover.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/ryan-rover/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
