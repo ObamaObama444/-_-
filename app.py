@@ -31,6 +31,8 @@ DEFAULT_ROBOT_CAPTURE_FRAME_COUNT = 4
 DEFAULT_ROBOT_CAPTURE_WAIT_TIMEOUT_SEC = 30
 DEFAULT_ROBOT_CAPTURE_POLL_TIMEOUT_SEC = 25
 DEFAULT_ROBOT_CAPTURE_MAX_BODY_BYTES = 8_000_000
+DEFAULT_BUBA_GATE_TIMEOUT_SEC = 45
+DEFAULT_BUBA_GATE_KNOWN_THRESHOLD = 0.70
 DEFAULT_BUBA_TIMEOUT_SEC = 90
 
 CHAT_BINDINGS_BY_USER_ID: dict[int, int] = {}
@@ -684,12 +686,75 @@ def buba_is_configured() -> bool:
     return (
         buba_dir.exists()
         and (buba_dir / ".venv/bin/python").exists()
+        and (buba_dir / "scripts/infer_gate5.py").exists()
         and (buba_dir / "scripts/infer_burst.py").exists()
+        and (buba_dir / "outputs_gate5/checkpoints/best.pt").exists()
         and (buba_dir / "outputs_swin_burst/checkpoints/best.pt").exists()
     )
 
 
 def run_buba_inference(capture_dir: Path, request_id: str) -> dict[str, Any]:
+    gate_report = run_buba_gate_inference(capture_dir, request_id=request_id)
+    if not gate_allows_big_model(gate_report):
+        return build_unknown_gate_report(gate_report)
+
+    burst_report = run_buba_burst_inference(capture_dir, request_id=request_id)
+    burst_report["gate_status"] = gate_report.get("status")
+    burst_report["gate_frames_passed"] = gate_report.get("frames_passed")
+    burst_report["gate_known_ratio"] = gate_report.get("known_ratio")
+    burst_report["gate_report_path"] = gate_report.get("report_path")
+    return burst_report
+
+
+def run_buba_gate_inference(capture_dir: Path, request_id: str) -> dict[str, Any]:
+    buba_dir = Path(os.getenv("BUBA_DIR", "/opt/apps/buba"))
+    python_bin = Path(os.getenv("BUBA_PYTHON", str(buba_dir / ".venv/bin/python")))
+    script_path = Path(os.getenv("BUBA_GATE_SCRIPT", str(buba_dir / "scripts/infer_gate5.py")))
+    checkpoint_path = Path(os.getenv("BUBA_GATE_CHECKPOINT", str(buba_dir / "outputs_gate5/checkpoints/best.pt")))
+    reports_dir = Path(os.getenv("BUBA_GATE_REPORTS_DIR", str(buba_dir / "outputs_gate5/reports")))
+    report_path = reports_dir / f"miniapp_gate_{request_id}.json"
+    timeout_sec = max(5, env_int("BUBA_GATE_TIMEOUT_SEC", DEFAULT_BUBA_GATE_TIMEOUT_SEC))
+    known_threshold = min(
+        1.0,
+        max(0.0, env_float("BUBA_GATE_KNOWN_THRESHOLD", DEFAULT_BUBA_GATE_KNOWN_THRESHOLD)),
+    )
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(python_bin),
+        str(script_path),
+        "--checkpoint",
+        str(checkpoint_path),
+        "--frames",
+        str(capture_dir),
+        "--known-threshold",
+        str(known_threshold),
+        "--out",
+        str(report_path),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=str(buba_dir),
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"Gate-модель завершилась с ошибкой: {stderr[-1000:]}")
+
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as error:
+        raise RuntimeError("Gate-модель не записала корректный JSON-отчёт") from error
+
+    report["report_path"] = str(report_path)
+    report["known_threshold"] = known_threshold
+    return report
+
+
+def run_buba_burst_inference(capture_dir: Path, request_id: str) -> dict[str, Any]:
     buba_dir = Path(os.getenv("BUBA_DIR", "/opt/apps/buba"))
     python_bin = Path(os.getenv("BUBA_PYTHON", str(buba_dir / ".venv/bin/python")))
     script_path = Path(os.getenv("BUBA_INFER_SCRIPT", str(buba_dir / "scripts/infer_burst.py")))
@@ -730,32 +795,84 @@ def run_buba_inference(capture_dir: Path, request_id: str) -> dict[str, Any]:
     return report
 
 
+def gate_allows_big_model(gate_report: dict[str, Any]) -> bool:
+    frames_passed = gate_report.get("frames_passed")
+    if isinstance(frames_passed, int):
+        return frames_passed > 0
+
+    frames = gate_report.get("frames")
+    if isinstance(frames, list):
+        return any(isinstance(frame, dict) and bool(frame.get("passed_to_big_model")) for frame in frames)
+
+    return gate_report.get("status") == "known"
+
+
+def build_unknown_gate_report(gate_report: dict[str, Any]) -> dict[str, Any]:
+    frames = gate_report.get("frames")
+    frames_total = int(gate_report.get("frames_total") or (len(frames) if isinstance(frames, list) else 0))
+    frames_passed = int(gate_report.get("frames_passed") or 0)
+
+    return {
+        "final_class": "unknown",
+        "confidence": None,
+        "status": "unknown",
+        "reason": "gate-модель не нашла объект из известных классов",
+        "frames_valid": frames_passed,
+        "frames_total": frames_total,
+        "gate_status": gate_report.get("status"),
+        "gate_frames_passed": frames_passed,
+        "gate_known_ratio": gate_report.get("known_ratio"),
+        "gate_report_path": gate_report.get("report_path"),
+    }
+
+
 def summarize_report(report: dict[str, Any]) -> dict[str, Any]:
     return {
         "final_class": report.get("final_class"),
         "confidence": report.get("confidence"),
         "status": report.get("status"),
+        "reason": report.get("reason"),
         "frames_valid": report.get("frames_valid"),
         "frames_total": report.get("frames_total"),
         "report_path": report.get("report_path"),
+        "gate_status": report.get("gate_status"),
+        "gate_frames_passed": report.get("gate_frames_passed"),
+        "gate_known_ratio": report.get("gate_known_ratio"),
+        "gate_report_path": report.get("gate_report_path"),
     }
 
 
 def format_analysis_message(report: dict[str, Any]) -> str:
     final_class = str(report.get("final_class", "unknown"))
-    confidence = float(report.get("confidence") or 0.0)
     status = str(report.get("status", "unknown"))
     frames_valid = int(report.get("frames_valid") or 0)
     frames_total = int(report.get("frames_total") or 0)
+    display_class = "неизвестный" if final_class == "unknown" else final_class
+
     lines = [
         "Результат анализа:",
-        f"Класс: {final_class}",
-        f"Accuracy: {confidence * 100:.1f}%",
-        f"Статус: {status}",
-        f"Кадры: {frames_valid}/{frames_total}",
+        f"Класс: {display_class}",
     ]
-    if status in {"uncertain", "retry"}:
+
+    confidence = report.get("confidence")
+    if isinstance(confidence, (int, float)):
+        lines.append(f"Accuracy: {float(confidence) * 100:.1f}%")
+
+    lines.extend(
+        [
+            f"Статус: {status}",
+            f"Кадры: {frames_valid}/{frames_total}",
+        ]
+    )
+
+    reason = report.get("reason")
+    if isinstance(reason, str) and reason:
+        lines.append(f"Причина: {reason}.")
+    elif status == "unknown":
+        lines.append("Причина: gate-модель не нашла объект из известных классов.")
+    elif status in {"uncertain", "retry"}:
         lines.append("Причина: мало уверенности или недостаточно резких кадров.")
+
     return "\n".join(lines)
 
 

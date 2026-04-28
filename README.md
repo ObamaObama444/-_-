@@ -42,7 +42,7 @@ INIT_DATA_MAX_AGE_SEC=86400
 DEFAULT_CHAT_ID=123456789  # опционально, fallback для отладки
 ```
 
-Кнопка `Начать` в Mini App вызывает `POST /api/start`: backend создаёт задание на захват, робот-агент забирает его через `POST /api/robot/capture/next`, отправляет пачку кадров на `POST /api/robot/capture/result`, backend прогоняет модель из `/opt/apps/buba` и отправляет в Telegram текст с классом и accuracy.
+Кнопка `Начать` в Mini App вызывает `POST /api/start`: backend создаёт задание на захват, робот-агент забирает его через `POST /api/robot/capture/next`, отправляет пачку кадров на `POST /api/robot/capture/result`, backend сначала прогоняет gate-модель из `/opt/apps/buba`, затем при известном классе запускает большую burst-модель и отправляет в Telegram текст с классом и accuracy. Если gate видит `unknown`, большая модель не запускается, а бот пишет, что класс неизвестный.
 
 ## Push-режим для робота за NAT
 
@@ -72,6 +72,8 @@ ROBOT_PUSH_TOKEN=long-random-secret
 ROBOT_CAPTURE_FRAME_COUNT=4
 ROBOT_CAPTURE_WAIT_TIMEOUT_SEC=30
 BUBA_DIR=/opt/apps/buba
+BUBA_GATE_TIMEOUT_SEC=45
+BUBA_GATE_KNOWN_THRESHOLD=0.70
 BUBA_TIMEOUT_SEC=90
 DEFAULT_CHAT_ID=123456789
 ```
@@ -210,5 +212,5 @@ sudo systemctl restart ryan-rover
 2. Напиши `/start`.
 3. Нажми кнопку `Открыть Райн-ровер`.
 4. В Mini App нажми `Начать`.
-5. Проверь, что бот прислал фото в чат.
+5. Проверь, что бот прислал текстовый результат анализа в чат.
 6. Если меню Telegram уже обновилось, можно открыть Mini App через кнопку меню бота.
