@@ -11,6 +11,7 @@ Mini App URL: `https://www.adolanna.ru`
 app.py              # HTTP server + Telegram Bot API long polling
 .env                # готовые переменные для бота и домена
 robot_push_frame.py # агент для Raspberry Pi: пушит кадры на ВМ по HTTP
+robot_capture_agent.py # агент для Raspberry Pi: снимает кадры только по заданию ВМ
 web/index.html      # HTML
 web/styles.css      # CSS
 web/app.js          # JS flow + POST /api/start по кнопке "Начать"
@@ -41,7 +42,7 @@ INIT_DATA_MAX_AGE_SEC=86400
 DEFAULT_CHAT_ID=123456789  # опционально, fallback для отладки
 ```
 
-Кнопка `Начать` в Mini App вызывает `POST /api/start`: backend берёт последний кадр, который робот сам прислал на `POST /api/robot/frame`, и отправляет его в чат Telegram через `sendPhoto`. Если свежего push-кадра нет, backend может попробовать старый pull-режим через `ROBOT_CAMERA_URL`.
+Кнопка `Начать` в Mini App вызывает `POST /api/start`: backend создаёт задание на захват, робот-агент забирает его через `POST /api/robot/capture/next`, отправляет пачку кадров на `POST /api/robot/capture/result`, backend прогоняет модель из `/opt/apps/buba` и отправляет в Telegram текст с классом и accuracy.
 
 ## Push-режим для робота за NAT
 
@@ -61,6 +62,30 @@ curl https://www.adolanna.ru/health
 ```
 
 В ответе `robot_frame` должен стать `true`, а `robot_frame_age_sec` должен быть небольшим числом.
+
+## On-demand анализ через модель
+
+На ВМ должны быть заданы:
+
+```bash
+ROBOT_PUSH_TOKEN=long-random-secret
+ROBOT_CAPTURE_FRAME_COUNT=4
+ROBOT_CAPTURE_WAIT_TIMEOUT_SEC=30
+BUBA_DIR=/opt/apps/buba
+BUBA_TIMEOUT_SEC=90
+DEFAULT_CHAT_ID=123456789
+```
+
+На роботе запусти агента:
+
+```bash
+export MINIAPP_BASE_URL=https://www.adolanna.ru
+export ROBOT_PUSH_TOKEN=long-random-secret
+export ROBOT_RTSP_URL=rtsp://172.18.0.2:8554/cam
+python3 robot_capture_agent.py
+```
+
+Агент не шлёт кадры постоянно: он ждёт задание от ВМ и снимает пачку кадров только после нажатия `Начать`.
 
 ## Быстрый деплой на ВМ
 

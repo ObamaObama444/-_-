@@ -5,6 +5,9 @@ import logging
 import mimetypes
 import os
 import re
+import base64
+import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -24,12 +27,20 @@ DEFAULT_MAX_FRAME_BYTES = 3_500_000
 DEFAULT_INIT_DATA_MAX_AGE_SEC = 86_400
 DEFAULT_PHOTO_CAPTION = "Кадр с робота получен."
 DEFAULT_ROBOT_FRAME_MAX_AGE_SEC = 300
+DEFAULT_ROBOT_CAPTURE_FRAME_COUNT = 4
+DEFAULT_ROBOT_CAPTURE_WAIT_TIMEOUT_SEC = 30
+DEFAULT_ROBOT_CAPTURE_POLL_TIMEOUT_SEC = 25
+DEFAULT_ROBOT_CAPTURE_MAX_BODY_BYTES = 8_000_000
+DEFAULT_BUBA_TIMEOUT_SEC = 90
 
 CHAT_BINDINGS_BY_USER_ID: dict[int, int] = {}
 LAST_KNOWN_CHAT_ID: int | None = None
 CHAT_BINDINGS_LOCK = threading.Lock()
 LATEST_ROBOT_FRAME: dict[str, Any] = {}
 LATEST_ROBOT_FRAME_LOCK = threading.Lock()
+CAPTURE_CONDITION = threading.Condition()
+CAPTURE_REQUESTS: dict[str, dict[str, Any]] = {}
+CAPTURE_QUEUE: list[str] = []
 
 
 def load_env(path: Path = BASE_DIR / ".env") -> None:
@@ -54,6 +65,18 @@ def env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         logging.warning("%s must be an integer, using %s", name, default)
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if not value:
+        return default
+
+    try:
+        return float(value)
+    except ValueError:
+        logging.warning("%s must be a number, using %s", name, default)
         return default
 
 
@@ -241,6 +264,14 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self.handle_robot_frame_upload()
             return
 
+        if parsed.path == "/api/robot/capture/next":
+            self.handle_robot_capture_next()
+            return
+
+        if parsed.path == "/api/robot/capture/result":
+            self.handle_robot_capture_result()
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_HEAD(self) -> None:
@@ -252,6 +283,7 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
 
     def send_health(self, head_only: bool = False) -> None:
         robot_frame_age_sec = get_latest_robot_frame_age_sec()
+        capture_counts = get_capture_counts()
         body = json.dumps(
             {
                 "ok": True,
@@ -259,6 +291,8 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
                 "bot": bool(os.getenv("BOT_TOKEN") and os.getenv("WEBAPP_URL")),
                 "robot_frame": robot_frame_age_sec is not None,
                 "robot_frame_age_sec": robot_frame_age_sec,
+                "capture": capture_counts,
+                "buba": buba_is_configured(),
             },
             ensure_ascii=False,
         ).encode("utf-8")
@@ -279,8 +313,8 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def read_json_body(self) -> dict[str, Any]:
-        content_length = env_int("MAX_POST_BODY_BYTES", 256_000)
+    def read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
+        content_length = max_bytes if max_bytes is not None else env_int("MAX_POST_BODY_BYTES", 256_000)
         try:
             expected = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -297,7 +331,7 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
 
         return parsed if isinstance(parsed, dict) else {}
 
-    def handle_robot_frame_upload(self) -> None:
+    def authenticate_robot(self) -> bool:
         configured_token = os.getenv("ROBOT_PUSH_TOKEN")
         incoming_token = self.headers.get("X-Robot-Token") or ""
 
@@ -306,10 +340,16 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"ok": False, "error": "ROBOT_PUSH_TOKEN is missing on backend"},
             )
-            return
+            return False
 
         if not hmac.compare_digest(incoming_token, configured_token):
             self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Invalid robot token"})
+            return False
+
+        return True
+
+    def handle_robot_frame_upload(self) -> None:
+        if not self.authenticate_robot():
             return
 
         try:
@@ -338,9 +378,46 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
         remember_robot_frame(image_bytes, content_type)
         self.send_json(HTTPStatus.OK, {"ok": True, "bytes": len(image_bytes)})
 
+    def handle_robot_capture_next(self) -> None:
+        if not self.authenticate_robot():
+            return
+
+        timeout_sec = max(1.0, env_float("ROBOT_CAPTURE_POLL_TIMEOUT_SEC", DEFAULT_ROBOT_CAPTURE_POLL_TIMEOUT_SEC))
+        request_payload = claim_capture_request(timeout_sec=timeout_sec)
+        if not request_payload:
+            self.send_json(HTTPStatus.OK, {"ok": True, "idle": True})
+            return
+
+        self.send_json(HTTPStatus.OK, {"ok": True, **request_payload})
+
+    def handle_robot_capture_result(self) -> None:
+        if not self.authenticate_robot():
+            return
+
+        max_bytes = max(1_000_000, env_int("ROBOT_CAPTURE_MAX_BODY_BYTES", DEFAULT_ROBOT_CAPTURE_MAX_BODY_BYTES))
+        payload = self.read_json_body(max_bytes=max_bytes)
+        request_id = payload.get("request_id")
+        frames = payload.get("frames")
+
+        if not isinstance(request_id, str) or not isinstance(frames, list):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Expected request_id and frames[]"})
+            return
+
+        try:
+            capture_dir = save_capture_frames(request_id, frames)
+            complete_capture_request(request_id, capture_dir, len(frames))
+        except KeyError:
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Unknown capture request"})
+            return
+        except Exception as error:
+            fail_capture_request(request_id, str(error))
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(error)})
+            return
+
+        self.send_json(HTTPStatus.OK, {"ok": True, "request_id": request_id, "frames": len(frames)})
+
     def handle_start_request(self) -> None:
         token = os.getenv("BOT_TOKEN")
-        camera_url = os.getenv("ROBOT_CAMERA_URL")
         if not token:
             self.send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -363,42 +440,45 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             )
             return
 
-        timeout_sec = max(2, env_int("ROBOT_CAMERA_TIMEOUT_SEC", DEFAULT_CAMERA_TIMEOUT_SEC))
-        max_bytes = max(300_000, env_int("ROBOT_MAX_FRAME_BYTES", DEFAULT_MAX_FRAME_BYTES))
-        caption = os.getenv("ROBOT_SCREENSHOT_CAPTION", DEFAULT_PHOTO_CAPTION)
+        frame_count = max(1, env_int("ROBOT_CAPTURE_FRAME_COUNT", DEFAULT_ROBOT_CAPTURE_FRAME_COUNT))
+        wait_timeout_sec = max(2.0, env_float("ROBOT_CAPTURE_WAIT_TIMEOUT_SEC", DEFAULT_ROBOT_CAPTURE_WAIT_TIMEOUT_SEC))
+        request_id = create_capture_request(frame_count=frame_count)
 
         try:
-            frame = get_latest_robot_frame(max_age_sec=env_int("ROBOT_FRAME_MAX_AGE_SEC", DEFAULT_ROBOT_FRAME_MAX_AGE_SEC))
-            if frame:
-                frame_bytes, content_type = frame
-            elif camera_url:
-                frame_bytes = fetch_robot_frame(camera_url, timeout_sec=timeout_sec, max_bytes=max_bytes)
-                content_type = "image/jpeg"
-            else:
-                raise ValueError(
-                    "Нет свежего кадра от робота. Запусти robot_push_frame.py на Raspberry Pi "
-                    "или задай ROBOT_CAMERA_URL для старого pull-режима."
-                )
-
-            response = telegram_request_multipart(
+            capture = wait_for_capture_request(request_id, timeout_sec=wait_timeout_sec)
+            report = run_buba_inference(capture["capture_dir"], request_id=request_id)
+            message = format_analysis_message(report)
+            response = telegram_request(
                 token=token,
-                method="sendPhoto",
-                fields={"chat_id": chat_id, "caption": caption},
-                files={"photo": ("robot.jpg", frame_bytes, content_type)},
+                method="sendMessage",
+                payload={"chat_id": chat_id, "text": message},
             )
         except Exception as error:
-            logging.exception("Failed to grab robot frame and send photo")
+            logging.exception("Failed to capture robot frames and run analysis")
+            notify_text = f"Не удалось выполнить анализ: {error}"
+            try:
+                telegram_request(token=token, method="sendMessage", payload={"chat_id": chat_id, "text": notify_text})
+            except Exception:
+                logging.exception("Failed to notify Telegram about analysis error")
             self.send_json(
                 HTTPStatus.BAD_GATEWAY,
-                {"ok": False, "error": f"Не удалось отправить кадр: {error}"},
+                {"ok": False, "request_id": request_id, "error": notify_text},
             )
             return
 
         if not response.get("ok"):
-            self.send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": "Telegram sendPhoto failed"})
+            self.send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "request_id": request_id, "error": "Telegram sendMessage failed"})
             return
 
-        self.send_json(HTTPStatus.OK, {"ok": True, "chat_id": chat_id})
+        self.send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "chat_id": chat_id,
+                "request_id": request_id,
+                "result": summarize_report(report),
+            },
+        )
 
     def serve_file_for_path(self, head_only: bool = False) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -434,6 +514,249 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
         if not head_only:
             with resolved.open("rb") as file:
                 self.copyfile(file, self.wfile)
+
+
+def get_capture_root() -> Path:
+    return Path(os.getenv("ROBOT_CAPTURE_DIR", "/tmp/ryan-rover-captures"))
+
+
+def cleanup_old_capture_requests(max_age_sec: int = 600) -> None:
+    now = time.time()
+    stale_ids = [
+        request_id
+        for request_id, request in CAPTURE_REQUESTS.items()
+        if now - float(request.get("created_at", now)) > max_age_sec
+    ]
+    for request_id in stale_ids:
+        request = CAPTURE_REQUESTS.pop(request_id, None)
+        if not request:
+            continue
+        capture_dir = request.get("capture_dir")
+        if isinstance(capture_dir, Path):
+            shutil.rmtree(capture_dir, ignore_errors=True)
+        if request_id in CAPTURE_QUEUE:
+            CAPTURE_QUEUE.remove(request_id)
+
+
+def create_capture_request(frame_count: int) -> str:
+    request_id = uuid.uuid4().hex
+    with CAPTURE_CONDITION:
+        cleanup_old_capture_requests()
+        CAPTURE_REQUESTS[request_id] = {
+            "request_id": request_id,
+            "frame_count": frame_count,
+            "status": "waiting",
+            "created_at": time.time(),
+        }
+        CAPTURE_QUEUE.append(request_id)
+        CAPTURE_CONDITION.notify_all()
+    logging.info("Created capture request %s for %s frames", request_id, frame_count)
+    return request_id
+
+
+def claim_capture_request(timeout_sec: float) -> dict[str, Any] | None:
+    deadline = time.time() + timeout_sec
+    with CAPTURE_CONDITION:
+        while True:
+            cleanup_old_capture_requests()
+            while CAPTURE_QUEUE:
+                request_id = CAPTURE_QUEUE.pop(0)
+                request = CAPTURE_REQUESTS.get(request_id)
+                if not request or request.get("status") != "waiting":
+                    continue
+                request["status"] = "assigned"
+                request["assigned_at"] = time.time()
+                logging.info("Assigned capture request %s", request_id)
+                return {
+                    "request_id": request_id,
+                    "frame_count": int(request["frame_count"]),
+                }
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            CAPTURE_CONDITION.wait(timeout=remaining)
+
+
+def wait_for_capture_request(request_id: str, timeout_sec: float) -> dict[str, Any]:
+    deadline = time.time() + timeout_sec
+    with CAPTURE_CONDITION:
+        while True:
+            request = CAPTURE_REQUESTS.get(request_id)
+            if not request:
+                raise RuntimeError("Задание захвата было удалено до завершения.")
+
+            status = request.get("status")
+            if status == "completed":
+                return dict(request)
+            if status == "failed":
+                raise RuntimeError(str(request.get("error") or "Робот не смог снять кадры."))
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                request["status"] = "failed"
+                request["error"] = "Робот не прислал кадры вовремя."
+                if request_id in CAPTURE_QUEUE:
+                    CAPTURE_QUEUE.remove(request_id)
+                CAPTURE_CONDITION.notify_all()
+                raise TimeoutError("Робот не прислал кадры вовремя.")
+
+            CAPTURE_CONDITION.wait(timeout=remaining)
+
+
+def complete_capture_request(request_id: str, capture_dir: Path, frame_count: int) -> None:
+    with CAPTURE_CONDITION:
+        request = CAPTURE_REQUESTS.get(request_id)
+        if not request:
+            shutil.rmtree(capture_dir, ignore_errors=True)
+            raise KeyError(request_id)
+
+        request.update(
+            {
+                "status": "completed",
+                "capture_dir": capture_dir,
+                "frames_received": frame_count,
+                "completed_at": time.time(),
+            }
+        )
+        CAPTURE_CONDITION.notify_all()
+    logging.info("Completed capture request %s with %s frames", request_id, frame_count)
+
+
+def fail_capture_request(request_id: str, error: str) -> None:
+    with CAPTURE_CONDITION:
+        request = CAPTURE_REQUESTS.get(request_id)
+        if request:
+            request["status"] = "failed"
+            request["error"] = error
+            CAPTURE_CONDITION.notify_all()
+
+
+def get_capture_counts() -> dict[str, int]:
+    with CAPTURE_CONDITION:
+        counts: dict[str, int] = {}
+        for request in CAPTURE_REQUESTS.values():
+            status = str(request.get("status", "unknown"))
+            counts[status] = counts.get(status, 0) + 1
+        return counts
+
+
+def save_capture_frames(request_id: str, frames: list[Any]) -> Path:
+    if not frames:
+        raise ValueError("frames[] must not be empty")
+
+    root = get_capture_root()
+    capture_dir = root / request_id
+    if capture_dir.exists():
+        shutil.rmtree(capture_dir)
+    capture_dir.mkdir(parents=True, exist_ok=True)
+
+    max_frame_bytes = max(300_000, env_int("ROBOT_MAX_FRAME_BYTES", DEFAULT_MAX_FRAME_BYTES))
+    for idx, frame in enumerate(frames):
+        content_type = "image/jpeg"
+        encoded: Any = frame
+        if isinstance(frame, dict):
+            encoded = frame.get("data")
+            content_type = str(frame.get("content_type") or content_type)
+
+        if not isinstance(encoded, str):
+            raise ValueError("Each frame must be a base64 string or an object with data")
+
+        try:
+            image_bytes = base64.b64decode(encoded, validate=True)
+        except Exception as error:
+            raise ValueError(f"Frame {idx} is not valid base64") from error
+
+        if not image_bytes or len(image_bytes) > max_frame_bytes:
+            raise ValueError(f"Frame {idx} has invalid size")
+        if not content_type.startswith("image/"):
+            raise ValueError(f"Frame {idx} has invalid content type")
+        if not image_bytes.startswith(b"\xff\xd8"):
+            raise ValueError(f"Frame {idx} is not a JPEG image")
+
+        (capture_dir / f"frame_{idx:03d}.jpg").write_bytes(image_bytes)
+
+    return capture_dir
+
+
+def buba_is_configured() -> bool:
+    buba_dir = Path(os.getenv("BUBA_DIR", "/opt/apps/buba"))
+    return (
+        buba_dir.exists()
+        and (buba_dir / ".venv/bin/python").exists()
+        and (buba_dir / "scripts/infer_burst.py").exists()
+        and (buba_dir / "outputs_swin_burst/checkpoints/best.pt").exists()
+    )
+
+
+def run_buba_inference(capture_dir: Path, request_id: str) -> dict[str, Any]:
+    buba_dir = Path(os.getenv("BUBA_DIR", "/opt/apps/buba"))
+    python_bin = Path(os.getenv("BUBA_PYTHON", str(buba_dir / ".venv/bin/python")))
+    script_path = Path(os.getenv("BUBA_INFER_SCRIPT", str(buba_dir / "scripts/infer_burst.py")))
+    checkpoint_path = Path(os.getenv("BUBA_CHECKPOINT", str(buba_dir / "outputs_swin_burst/checkpoints/best.pt")))
+    reports_dir = Path(os.getenv("BUBA_REPORTS_DIR", str(buba_dir / "outputs_swin_burst/reports")))
+    report_path = reports_dir / f"miniapp_{request_id}.json"
+    timeout_sec = max(5, env_int("BUBA_TIMEOUT_SEC", DEFAULT_BUBA_TIMEOUT_SEC))
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        str(python_bin),
+        str(script_path),
+        "--checkpoint",
+        str(checkpoint_path),
+        "--frames",
+        str(capture_dir),
+        "--out",
+        str(report_path),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=str(buba_dir),
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"Модель завершилась с ошибкой: {stderr[-1000:]}")
+
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception as error:
+        raise RuntimeError("Модель не записала корректный JSON-отчёт") from error
+
+    report["report_path"] = str(report_path)
+    return report
+
+
+def summarize_report(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "final_class": report.get("final_class"),
+        "confidence": report.get("confidence"),
+        "status": report.get("status"),
+        "frames_valid": report.get("frames_valid"),
+        "frames_total": report.get("frames_total"),
+        "report_path": report.get("report_path"),
+    }
+
+
+def format_analysis_message(report: dict[str, Any]) -> str:
+    final_class = str(report.get("final_class", "unknown"))
+    confidence = float(report.get("confidence") or 0.0)
+    status = str(report.get("status", "unknown"))
+    frames_valid = int(report.get("frames_valid") or 0)
+    frames_total = int(report.get("frames_total") or 0)
+    lines = [
+        "Результат анализа:",
+        f"Класс: {final_class}",
+        f"Accuracy: {confidence * 100:.1f}%",
+        f"Статус: {status}",
+        f"Кадры: {frames_valid}/{frames_total}",
+    ]
+    if status in {"uncertain", "retry"}:
+        lines.append("Причина: мало уверенности или недостаточно резких кадров.")
+    return "\n".join(lines)
 
 
 def remember_robot_frame(image_bytes: bytes, content_type: str) -> None:
