@@ -77,26 +77,33 @@ def fetch_first_jpeg(camera_url: str, timeout_sec: int, max_bytes: int) -> bytes
 
 
 def fetch_frame_with_ffmpeg(stream_url: str, timeout_sec: int, max_bytes: int) -> bytes:
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+    ]
+    if stream_url.startswith("rtsp://"):
+        command.extend(["-rtsp_transport", "tcp"])
+
+    command.extend(
+        [
+            "-i",
+            stream_url,
+            "-frames:v",
+            "1",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ]
+    )
+
     try:
         completed = subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-rw_timeout",
-                str(timeout_sec * 1_000_000),
-                "-i",
-                stream_url,
-                "-frames:v",
-                "1",
-                "-f",
-                "image2pipe",
-                "-vcodec",
-                "mjpeg",
-                "pipe:1",
-            ],
+            command,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
