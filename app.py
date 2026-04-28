@@ -31,6 +31,7 @@ DEFAULT_ROBOT_CAPTURE_FRAME_COUNT = 4
 DEFAULT_ROBOT_CAPTURE_WAIT_TIMEOUT_SEC = 30
 DEFAULT_ROBOT_CAPTURE_POLL_TIMEOUT_SEC = 25
 DEFAULT_ROBOT_CAPTURE_MAX_BODY_BYTES = 8_000_000
+DEFAULT_ROBOT_MISSION_MAX_BODY_BYTES = 50_000_000
 DEFAULT_BUBA_GATE_TIMEOUT_SEC = 45
 DEFAULT_BUBA_GATE_KNOWN_THRESHOLD = 0.70
 DEFAULT_BUBA_TIMEOUT_SEC = 90
@@ -274,6 +275,10 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self.handle_robot_capture_result()
             return
 
+        if parsed.path == "/api/robot/mission/classify-point":
+            self.handle_robot_mission_classify_point()
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_HEAD(self) -> None:
@@ -417,6 +422,58 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             return
 
         self.send_json(HTTPStatus.OK, {"ok": True, "request_id": request_id, "frames": len(frames)})
+
+    def handle_robot_mission_classify_point(self) -> None:
+        if not self.authenticate_robot():
+            return
+
+        max_bytes = max(1_000_000, env_int("ROBOT_MISSION_MAX_BODY_BYTES", DEFAULT_ROBOT_MISSION_MAX_BODY_BYTES))
+        payload = self.read_json_body(max_bytes=max_bytes)
+        mission_id = payload.get("mission_id")
+        point_id = payload.get("point_id")
+        point = payload.get("point")
+        frames = payload.get("frames")
+
+        if not isinstance(mission_id, str) or not isinstance(point_id, str) or not isinstance(frames, list):
+            self.send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "Expected mission_id, point_id and frames[]"},
+            )
+            return
+        if point is not None and not isinstance(point, dict):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "point must be an object"})
+            return
+
+        try:
+            capture_dir = save_mission_frames(mission_id, point_id, frames)
+            report = run_buba_inference(
+                capture_dir,
+                request_id=f"mission_{safe_path_part(mission_id)}_{safe_path_part(point_id)}",
+            )
+        except Exception as error:
+            logging.exception("Failed to classify mission point %s/%s", mission_id, point_id)
+            self.send_json(
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "ok": False,
+                    "mission_id": mission_id,
+                    "point_id": point_id,
+                    "error": str(error),
+                },
+            )
+            return
+
+        self.send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "mission_id": mission_id,
+                "point_id": point_id,
+                "point": point or {},
+                "capture_dir": str(capture_dir),
+                **summarize_report(report),
+            },
+        )
 
     def handle_start_request(self) -> None:
         token = os.getenv("BOT_TOKEN")
@@ -649,6 +706,57 @@ def save_capture_frames(request_id: str, frames: list[Any]) -> Path:
 
     root = get_capture_root()
     capture_dir = root / request_id
+    if capture_dir.exists():
+        shutil.rmtree(capture_dir)
+    capture_dir.mkdir(parents=True, exist_ok=True)
+
+    max_frame_bytes = max(300_000, env_int("ROBOT_MAX_FRAME_BYTES", DEFAULT_MAX_FRAME_BYTES))
+    for idx, frame in enumerate(frames):
+        content_type = "image/jpeg"
+        encoded: Any = frame
+        if isinstance(frame, dict):
+            encoded = frame.get("data")
+            content_type = str(frame.get("content_type") or content_type)
+
+        if not isinstance(encoded, str):
+            raise ValueError("Each frame must be a base64 string or an object with data")
+
+        try:
+            image_bytes = base64.b64decode(encoded, validate=True)
+        except Exception as error:
+            raise ValueError(f"Frame {idx} is not valid base64") from error
+
+        if not image_bytes or len(image_bytes) > max_frame_bytes:
+            raise ValueError(f"Frame {idx} has invalid size")
+        if not content_type.startswith("image/"):
+            raise ValueError(f"Frame {idx} has invalid content type")
+        if not image_bytes.startswith(b"\xff\xd8"):
+            raise ValueError(f"Frame {idx} is not a JPEG image")
+
+        (capture_dir / f"frame_{idx:03d}.jpg").write_bytes(image_bytes)
+
+    return capture_dir
+
+
+def get_mission_root() -> Path:
+    return Path(os.getenv("ROBOT_MISSION_DIR", "/tmp/ryan-rover-missions"))
+
+
+def safe_path_part(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    cleaned = cleaned.strip("._-")
+    if not cleaned:
+        raise ValueError("Invalid empty id")
+    return cleaned[:96]
+
+
+def save_mission_frames(mission_id: str, point_id: str, frames: list[Any]) -> Path:
+    if not frames:
+        raise ValueError("frames[] must not be empty")
+
+    mission_part = safe_path_part(mission_id)
+    point_part = safe_path_part(point_id)
+    capture_dir = get_mission_root() / mission_part / point_part
     if capture_dir.exists():
         shutil.rmtree(capture_dir)
     capture_dir.mkdir(parents=True, exist_ok=True)
