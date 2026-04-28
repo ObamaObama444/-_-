@@ -23,10 +23,13 @@ DEFAULT_CAMERA_TIMEOUT_SEC = 8
 DEFAULT_MAX_FRAME_BYTES = 3_500_000
 DEFAULT_INIT_DATA_MAX_AGE_SEC = 86_400
 DEFAULT_PHOTO_CAPTION = "Кадр с робота получен."
+DEFAULT_ROBOT_FRAME_MAX_AGE_SEC = 300
 
 CHAT_BINDINGS_BY_USER_ID: dict[int, int] = {}
 LAST_KNOWN_CHAT_ID: int | None = None
 CHAT_BINDINGS_LOCK = threading.Lock()
+LATEST_ROBOT_FRAME: dict[str, Any] = {}
+LATEST_ROBOT_FRAME_LOCK = threading.Lock()
 
 
 def load_env(path: Path = BASE_DIR / ".env") -> None:
@@ -234,6 +237,10 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self.handle_start_request()
             return
 
+        if parsed.path == "/api/robot/frame":
+            self.handle_robot_frame_upload()
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_HEAD(self) -> None:
@@ -244,11 +251,14 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
         self.serve_file_for_path(head_only=True)
 
     def send_health(self, head_only: bool = False) -> None:
+        robot_frame_age_sec = get_latest_robot_frame_age_sec()
         body = json.dumps(
             {
                 "ok": True,
                 "service": "ryan-rover-miniapp",
                 "bot": bool(os.getenv("BOT_TOKEN") and os.getenv("WEBAPP_URL")),
+                "robot_frame": robot_frame_age_sec is not None,
+                "robot_frame_age_sec": robot_frame_age_sec,
             },
             ensure_ascii=False,
         ).encode("utf-8")
@@ -287,6 +297,47 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
 
         return parsed if isinstance(parsed, dict) else {}
 
+    def handle_robot_frame_upload(self) -> None:
+        configured_token = os.getenv("ROBOT_PUSH_TOKEN")
+        incoming_token = self.headers.get("X-Robot-Token") or ""
+
+        if not configured_token:
+            self.send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"ok": False, "error": "ROBOT_PUSH_TOKEN is missing on backend"},
+            )
+            return
+
+        if not hmac.compare_digest(incoming_token, configured_token):
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "Invalid robot token"})
+            return
+
+        try:
+            expected = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            expected = 0
+
+        max_bytes = max(300_000, env_int("ROBOT_MAX_FRAME_BYTES", DEFAULT_MAX_FRAME_BYTES))
+        if expected <= 0 or expected > max_bytes:
+            self.send_json(
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                {"ok": False, "error": f"Image must be between 1 and {max_bytes} bytes"},
+            )
+            return
+
+        content_type = (self.headers.get("Content-Type") or "image/jpeg").split(";", 1)[0].strip().lower()
+        if not content_type.startswith("image/"):
+            self.send_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, {"ok": False, "error": "Expected image/*"})
+            return
+
+        image_bytes = self.rfile.read(expected)
+        if len(image_bytes) != expected:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Could not read full image body"})
+            return
+
+        remember_robot_frame(image_bytes, content_type)
+        self.send_json(HTTPStatus.OK, {"ok": True, "bytes": len(image_bytes)})
+
     def handle_start_request(self) -> None:
         token = os.getenv("BOT_TOKEN")
         camera_url = os.getenv("ROBOT_CAMERA_URL")
@@ -294,13 +345,6 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self.send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {"ok": False, "error": "BOT_TOKEN is missing on backend"},
-            )
-            return
-
-        if not camera_url:
-            self.send_json(
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                {"ok": False, "error": "ROBOT_CAMERA_URL is missing on backend"},
             )
             return
 
@@ -324,12 +368,23 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
         caption = os.getenv("ROBOT_SCREENSHOT_CAPTION", DEFAULT_PHOTO_CAPTION)
 
         try:
-            frame_bytes = fetch_robot_frame(camera_url, timeout_sec=timeout_sec, max_bytes=max_bytes)
+            frame = get_latest_robot_frame(max_age_sec=env_int("ROBOT_FRAME_MAX_AGE_SEC", DEFAULT_ROBOT_FRAME_MAX_AGE_SEC))
+            if frame:
+                frame_bytes, content_type = frame
+            elif camera_url:
+                frame_bytes = fetch_robot_frame(camera_url, timeout_sec=timeout_sec, max_bytes=max_bytes)
+                content_type = "image/jpeg"
+            else:
+                raise ValueError(
+                    "Нет свежего кадра от робота. Запусти robot_push_frame.py на Raspberry Pi "
+                    "или задай ROBOT_CAMERA_URL для старого pull-режима."
+                )
+
             response = telegram_request_multipart(
                 token=token,
                 method="sendPhoto",
                 fields={"chat_id": chat_id, "caption": caption},
-                files={"photo": ("robot.jpg", frame_bytes, "image/jpeg")},
+                files={"photo": ("robot.jpg", frame_bytes, content_type)},
             )
         except Exception as error:
             logging.exception("Failed to grab robot frame and send photo")
@@ -379,6 +434,43 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
         if not head_only:
             with resolved.open("rb") as file:
                 self.copyfile(file, self.wfile)
+
+
+def remember_robot_frame(image_bytes: bytes, content_type: str) -> None:
+    with LATEST_ROBOT_FRAME_LOCK:
+        LATEST_ROBOT_FRAME.clear()
+        LATEST_ROBOT_FRAME.update(
+            {
+                "bytes": image_bytes,
+                "content_type": content_type,
+                "received_at": time.time(),
+            }
+        )
+
+
+def get_latest_robot_frame(max_age_sec: int) -> tuple[bytes, str] | None:
+    with LATEST_ROBOT_FRAME_LOCK:
+        image_bytes = LATEST_ROBOT_FRAME.get("bytes")
+        content_type = LATEST_ROBOT_FRAME.get("content_type")
+        received_at = LATEST_ROBOT_FRAME.get("received_at")
+
+        if not isinstance(image_bytes, bytes) or not isinstance(content_type, str):
+            return None
+
+        if not isinstance(received_at, (int, float)) or time.time() - received_at > max_age_sec:
+            return None
+
+        return image_bytes, content_type
+
+
+def get_latest_robot_frame_age_sec() -> int | None:
+    with LATEST_ROBOT_FRAME_LOCK:
+        received_at = LATEST_ROBOT_FRAME.get("received_at")
+
+    if not isinstance(received_at, (int, float)):
+        return None
+
+    return max(0, int(time.time() - received_at))
 
 
 def resolve_chat_id(user_id: int | None) -> int | None:

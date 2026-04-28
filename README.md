@@ -10,6 +10,7 @@ Mini App URL: `https://www.adolanna.ru`
 ```text
 app.py              # HTTP server + Telegram Bot API long polling
 .env                # готовые переменные для бота и домена
+robot_push_frame.py # агент для Raspberry Pi: пушит кадры на ВМ по HTTP
 web/index.html      # HTML
 web/styles.css      # CSS
 web/app.js          # JS flow + POST /api/start по кнопке "Начать"
@@ -25,12 +26,14 @@ public/assets/      # ассеты из Figma
 ```text
 BOT_TOKEN=...
 WEBAPP_URL=https://your-domain
-ROBOT_CAMERA_URL=http://192.168.1.33:8889/cam/
+ROBOT_PUSH_TOKEN=long-random-secret
 ```
 
 Дополнительно:
 
 ```text
+ROBOT_CAMERA_URL=http://192.168.1.33:8889/cam/  # fallback для старого pull-режима
+ROBOT_FRAME_MAX_AGE_SEC=300
 ROBOT_CAMERA_TIMEOUT_SEC=8
 ROBOT_MAX_FRAME_BYTES=3500000
 ROBOT_SCREENSHOT_CAPTION=Кадр с робота получен.
@@ -38,7 +41,26 @@ INIT_DATA_MAX_AGE_SEC=86400
 DEFAULT_CHAT_ID=123456789  # опционально, fallback для отладки
 ```
 
-Кнопка `Начать` в Mini App теперь вызывает `POST /api/start`: backend берёт кадр из `ROBOT_CAMERA_URL` и отправляет его в чат Telegram через `sendPhoto`.
+Кнопка `Начать` в Mini App вызывает `POST /api/start`: backend берёт последний кадр, который робот сам прислал на `POST /api/robot/frame`, и отправляет его в чат Telegram через `sendPhoto`. Если свежего push-кадра нет, backend может попробовать старый pull-режим через `ROBOT_CAMERA_URL`.
+
+## Push-режим для робота за NAT
+
+Если робот находится в локальной сети, ВМ обычно не видит адреса вида `192.168.1.x`. В этом режиме Raspberry Pi сам делает исходящий HTTP-запрос на ВМ и отправляет кадр:
+
+```bash
+export ROBOT_CAMERA_URL=http://192.168.1.73:8889/cam/
+export MINIAPP_FRAME_ENDPOINT=https://www.adolanna.ru/api/robot/frame
+export ROBOT_PUSH_TOKEN=long-random-secret
+python3 robot_push_frame.py
+```
+
+Тот же `ROBOT_PUSH_TOKEN` должен быть указан в `.env` на ВМ. Проверить, что ВМ получила кадр:
+
+```bash
+curl https://www.adolanna.ru/health
+```
+
+В ответе `robot_frame` должен стать `true`, а `robot_frame_age_sec` должен быть небольшим числом.
 
 ## Быстрый деплой на ВМ
 
