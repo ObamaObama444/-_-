@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -44,24 +45,42 @@ def fetch_first_jpeg(camera_url: str, timeout_sec: int, max_bytes: int) -> bytes
             html = response.read(64_000).decode("utf-8", errors="ignore")
             stream_url = extract_stream_url_from_html(html, base_url=camera_url)
             if not stream_url:
-                raise ValueError("Could not find stream URL in camera HTML page")
+                raise ValueError(f"Could not find stream URL in camera HTML page: {html[:300]!r}")
             return fetch_first_jpeg(stream_url, timeout_sec=timeout_sec, max_bytes=max_bytes)
+
+        payload = response.read(max_bytes + 1)
+        if len(payload) > max_bytes:
+            raise ValueError("Camera response is too large")
+
+        start = payload.find(b"\xff\xd8")
+        end = payload.find(b"\xff\xd9", start + 2) if start != -1 else -1
+        if start != -1 and end != -1:
+            return payload[start : end + 2]
+
+        text = payload[:4096].decode("utf-8", errors="ignore")
+        stream_url = extract_stream_url_from_html(text, base_url=camera_url)
+        if stream_url:
+            return fetch_first_jpeg(stream_url, timeout_sec=timeout_sec, max_bytes=max_bytes)
+
+        if payload:
+            snippet = payload[:300].decode("utf-8", errors="ignore")
+            raise ValueError(f"Camera response is not JPEG. Content-Type={content_type or 'unknown'} body={snippet!r}")
 
         return read_first_jpeg_frame(response, max_bytes=max_bytes)
 
 
 def extract_stream_url_from_html(html: str, base_url: str) -> str | None:
-    lower = html.lower()
-    for marker in ('src="', "src='"):
-        index = lower.find(marker)
-        if index == -1:
-            continue
+    image_match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE)
+    if image_match:
+        return urllib.parse.urljoin(base_url, image_match.group(1))
 
-        start = index + len(marker)
-        quote = marker[-1]
-        end = html.find(quote, start)
-        if end != -1:
-            return urllib.parse.urljoin(base_url, html[start:end])
+    generic_match = re.search(
+        r'["\']([^"\']*(?:mjpg|mjpeg|stream|video|cam)[^"\']*)["\']',
+        html,
+        re.IGNORECASE,
+    )
+    if generic_match:
+        return urllib.parse.urljoin(base_url, generic_match.group(1))
 
     return None
 
