@@ -3,7 +3,7 @@
 Python backend + чистый HTML/CSS/JS frontend для Telegram Mini App.
 
 Бот: `https://t.me/RaianRoverYandex_bot`  
-Mini App URL: `https://adolanna.ru`
+Mini App URL: `https://www.adolanna.ru`
 
 ## Что внутри
 
@@ -82,7 +82,7 @@ sudo certbot --nginx -d adolanna.ru -d www.adolanna.ru
 После этого проверь:
 
 ```bash
-curl https://adolanna.ru/health
+curl https://www.adolanna.ru/health
 ```
 
 ## Запуск через systemd
