@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -24,6 +25,9 @@ def env_int(name: str, default: int) -> int:
 
 
 def fetch_first_jpeg(camera_url: str, timeout_sec: int, max_bytes: int) -> bytes:
+    if camera_url.startswith(("rtsp://", "rtmp://")) or camera_url.endswith(".m3u8"):
+        return fetch_frame_with_ffmpeg(camera_url, timeout_sec=timeout_sec, max_bytes=max_bytes)
+
     request = urllib.request.Request(
         camera_url,
         headers={
@@ -44,6 +48,8 @@ def fetch_first_jpeg(camera_url: str, timeout_sec: int, max_bytes: int) -> bytes
         if "text/html" in content_type:
             html = response.read(64_000).decode("utf-8", errors="ignore")
             stream_url = extract_stream_url_from_html(html, base_url=camera_url)
+            if not stream_url and "mediamtx" in (response.headers.get("Server") or "").lower():
+                stream_url = derive_mediamtx_hls_url(camera_url)
             if not stream_url:
                 raise ValueError(f"Could not find stream URL in camera HTML page: {html[:300]!r}")
             return fetch_first_jpeg(stream_url, timeout_sec=timeout_sec, max_bytes=max_bytes)
@@ -67,6 +73,57 @@ def fetch_first_jpeg(camera_url: str, timeout_sec: int, max_bytes: int) -> bytes
             raise ValueError(f"Camera response is not JPEG. Content-Type={content_type or 'unknown'} body={snippet!r}")
 
         return read_first_jpeg_frame(response, max_bytes=max_bytes)
+
+
+def fetch_frame_with_ffmpeg(stream_url: str, timeout_sec: int, max_bytes: int) -> bytes:
+    try:
+        completed = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-rw_timeout",
+                str(timeout_sec * 1_000_000),
+                "-i",
+                stream_url,
+                "-frames:v",
+                "1",
+                "-f",
+                "image2pipe",
+                "-vcodec",
+                "mjpeg",
+                "pipe:1",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec + 4,
+        )
+    except FileNotFoundError as error:
+        raise ValueError("ffmpeg is required for this camera stream") from error
+    except subprocess.CalledProcessError as error:
+        message = error.stderr.decode("utf-8", errors="ignore").strip()
+        raise ValueError(f"ffmpeg could not read stream {stream_url}: {message}") from error
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"ffmpeg timed out while reading stream {stream_url}") from error
+
+    if len(completed.stdout) > max_bytes:
+        raise ValueError("ffmpeg frame is too large")
+
+    if not completed.stdout.startswith(b"\xff\xd8"):
+        raise ValueError("ffmpeg did not return a JPEG frame")
+
+    return completed.stdout
+
+
+def derive_mediamtx_hls_url(camera_url: str) -> str:
+    parsed = urllib.parse.urlparse(camera_url)
+    hostname = parsed.hostname or "127.0.0.1"
+    path = parsed.path.strip("/")
+    stream_name = path.split("/", 1)[0] or "cam"
+    return urllib.parse.urlunparse(("http", f"{hostname}:8888", f"/{stream_name}/index.m3u8", "", "", ""))
 
 
 def extract_stream_url_from_html(html: str, base_url: str) -> str | None:
