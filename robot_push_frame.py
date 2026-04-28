@@ -47,9 +47,10 @@ def fetch_first_jpeg(camera_url: str, timeout_sec: int, max_bytes: int) -> bytes
 
         if "text/html" in content_type:
             html = response.read(64_000).decode("utf-8", errors="ignore")
-            stream_url = extract_stream_url_from_html(html, base_url=camera_url)
-            if not stream_url and "mediamtx" in (response.headers.get("Server") or "").lower():
+            if "mediamtx" in (response.headers.get("Server") or "").lower():
                 stream_url = derive_mediamtx_hls_url(camera_url)
+            else:
+                stream_url = extract_stream_url_from_html(html, base_url=camera_url)
             if not stream_url:
                 raise ValueError(f"Could not find stream URL in camera HTML page: {html[:300]!r}")
             return fetch_first_jpeg(stream_url, timeout_sec=timeout_sec, max_bytes=max_bytes)
@@ -132,7 +133,7 @@ def extract_stream_url_from_html(html: str, base_url: str) -> str | None:
         return urllib.parse.urljoin(base_url, image_match.group(1))
 
     generic_match = re.search(
-        r'["\']([^"\']*(?:mjpg|mjpeg|stream|video|cam)[^"\']*)["\']',
+        r'["\']((?:https?://|/|\.{1,2}/)[^"\'\s<>]*(?:mjpg|mjpeg|stream|video|cam)[^"\'\s<>]*)["\']',
         html,
         re.IGNORECASE,
     )
