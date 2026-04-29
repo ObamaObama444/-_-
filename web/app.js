@@ -3,6 +3,7 @@ const START_API_PATH = "/api/start";
 const MISSION_STATUS_API_PATH = "/api/mission/status";
 const MISSION_POLL_INTERVAL_MS = 2000;
 const MISSION_MAX_WAIT_MS = 30 * 60 * 1000;
+const MISSION_POINT_TOTAL = 8;
 
 const screens = {
   welcome: document.querySelector('[data-screen="welcome"]'),
@@ -10,8 +11,12 @@ const screens = {
   loading: document.querySelector('[data-screen="loading"]'),
   result: document.querySelector('[data-screen="result"]'),
 };
+const missionStatusElement = document.querySelector("[data-mission-status]");
+const resultStatusElement = document.querySelector("[data-result-status]");
+const resultTargetElement = document.querySelector("[data-result-target]");
 let started = false;
 let missionStartedAt = 0;
+let lastMissionStatus = null;
 
 function setupTelegram() {
   const webApp = window.Telegram?.WebApp;
@@ -42,6 +47,68 @@ function updateCounts(counts = {}) {
     const key = element.dataset.count;
     element.textContent = formatCount(counts[key]);
   });
+}
+
+function setText(element, value) {
+  if (element) {
+    element.textContent = value || "";
+  }
+}
+
+function pointProgress(status = {}) {
+  const points = Array.isArray(status.points) ? status.points.length : 0;
+  return `${Math.min(points, MISSION_POINT_TOTAL)}/${MISSION_POINT_TOTAL}`;
+}
+
+function updateLoadingStatus(status = {}) {
+  const state = status.status || "waiting";
+  if (state === "waiting") {
+    setText(missionStatusElement, "Ждём робота");
+    return;
+  }
+  if (state === "assigned") {
+    setText(missionStatusElement, "Робот принял маршрут");
+    return;
+  }
+  if (state === "running") {
+    setText(missionStatusElement, `Точек: ${pointProgress(status)}`);
+    return;
+  }
+  if (state === "completed") {
+    setText(missionStatusElement, "Маршрут завершён");
+    return;
+  }
+  if (state === "failed") {
+    setText(missionStatusElement, "Маршрут остановился");
+    return;
+  }
+  setText(missionStatusElement, "Маршрут в работе");
+}
+
+function formatTarget(target) {
+  if (!target || typeof target !== "object") {
+    return "";
+  }
+
+  const className = target.class_name;
+  const pointId = target.point?.id;
+  if (!className || !pointId) {
+    return "";
+  }
+
+  return `Финиш: ${className}, ${pointId}`;
+}
+
+function renderResult(status = {}) {
+  if (!status.status || status.status === "running") {
+    setText(resultStatusElement, "");
+    setText(resultTargetElement, "");
+    return;
+  }
+
+  const completed = status.status === "completed";
+  setText(resultStatusElement, completed ? "Маршрут завершён" : "Маршрут остановился");
+  setText(resultTargetElement, status.error || formatTarget(status.target));
 }
 
 async function startMission() {
@@ -81,7 +148,9 @@ function wait(ms) {
 async function pollMissionUntilFinished(missionId) {
   while (Date.now() - missionStartedAt < MISSION_MAX_WAIT_MS) {
     const status = await fetchMissionStatus(missionId);
+    lastMissionStatus = status;
     updateCounts(status.counts);
+    updateLoadingStatus(status);
 
     if (status.status === "completed" || status.status === "failed") {
       return status;
@@ -99,20 +168,32 @@ async function startAnalytics() {
   }
   started = true;
   missionStartedAt = Date.now();
+  lastMissionStatus = null;
   updateCounts();
+  updateLoadingStatus({ status: "waiting", points: [] });
+  renderResult({ status: "running" });
 
   showScreen("loading");
 
   try {
     const mission = await startMission();
+    lastMissionStatus = mission;
     updateCounts(mission.counts);
+    updateLoadingStatus(mission);
     const finished = await pollMissionUntilFinished(mission.mission_id);
     updateCounts(finished.counts);
+    renderResult(finished);
     window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred?.(
       finished.status === "completed" ? "success" : "error",
     );
   } catch (error) {
     console.error("Failed to run rover mission:", error);
+    updateCounts(lastMissionStatus?.counts);
+    renderResult({
+      status: "failed",
+      counts: lastMissionStatus?.counts,
+      error: "Не удалось запустить маршрут",
+    });
     window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred?.("error");
   } finally {
     showScreen("result");

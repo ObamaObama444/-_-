@@ -11,12 +11,18 @@ DEFAULT_BASE_URL = "https://www.adolanna.ru"
 DEFAULT_POLL_TIMEOUT_SEC = 25
 DEFAULT_REQUEST_TIMEOUT_SEC = 35
 DEFAULT_RETRY_SLEEP_SEC = 3
+DEFAULT_MISSION_DWELL_SEC = "5.0"
+DEFAULT_MISSION_MIN_FRAME_COUNT = "4"
+DEFAULT_MISSION_FFMPEG_TIMEOUT_SEC = "45"
 DEFAULT_MISSION_COMMAND = (
     'docker exec '
     '-e MISSION_ID="{mission_id}" '
     '-e MINIAPP_BASE_URL="{base_url}" '
     '-e ROBOT_PUSH_TOKEN="{robot_token}" '
     '-e ROBOT_RTSP_URL="{rtsp_url}" '
+    '-e MISSION_DWELL_SEC="{mission_dwell_sec}" '
+    '-e MISSION_MIN_FRAME_COUNT="{mission_min_frame_count}" '
+    '-e MISSION_FFMPEG_TIMEOUT_SEC="{mission_ffmpeg_timeout_sec}" '
     'ros bash -ic "python3 /src/scripts/drive_scan_classify_mission.py"'
 )
 
@@ -47,12 +53,24 @@ def post_json(url, token, payload, timeout_sec):
     return data if isinstance(data, dict) else {}
 
 
-def build_command(template, mission_id, base_url, robot_token, rtsp_url):
+def build_command(
+    template,
+    mission_id,
+    base_url,
+    robot_token,
+    rtsp_url,
+    mission_dwell_sec,
+    mission_min_frame_count,
+    mission_ffmpeg_timeout_sec,
+):
     return template.format(
         mission_id=mission_id,
         base_url=base_url,
         robot_token=robot_token,
         rtsp_url=rtsp_url,
+        mission_dwell_sec=mission_dwell_sec,
+        mission_min_frame_count=mission_min_frame_count,
+        mission_ffmpeg_timeout_sec=mission_ffmpeg_timeout_sec,
     )
 
 
@@ -79,6 +97,9 @@ def main():
     robot_token = os.getenv("ROBOT_PUSH_TOKEN")
     rtsp_url = os.getenv("ROBOT_RTSP_URL", "rtsp://172.18.0.2:8554/cam")
     command_template = os.getenv("ROBOT_MISSION_COMMAND", DEFAULT_MISSION_COMMAND)
+    mission_dwell_sec = os.getenv("MISSION_DWELL_SEC", DEFAULT_MISSION_DWELL_SEC)
+    mission_min_frame_count = os.getenv("MISSION_MIN_FRAME_COUNT", DEFAULT_MISSION_MIN_FRAME_COUNT)
+    mission_ffmpeg_timeout_sec = os.getenv("MISSION_FFMPEG_TIMEOUT_SEC", DEFAULT_MISSION_FFMPEG_TIMEOUT_SEC)
     poll_timeout_sec = env_int("ROBOT_MISSION_POLL_TIMEOUT_SEC", DEFAULT_POLL_TIMEOUT_SEC)
     request_timeout_sec = env_int("ROBOT_MISSION_REQUEST_TIMEOUT_SEC", DEFAULT_REQUEST_TIMEOUT_SEC)
     retry_sleep_sec = env_int("ROBOT_MISSION_RETRY_SLEEP_SEC", DEFAULT_RETRY_SLEEP_SEC)
@@ -113,7 +134,16 @@ def main():
             time.sleep(retry_sleep_sec)
             continue
 
-        command = build_command(command_template, mission_id, base_url, robot_token, rtsp_url)
+        command = build_command(
+            command_template,
+            mission_id,
+            base_url,
+            robot_token,
+            rtsp_url,
+            mission_dwell_sec,
+            mission_min_frame_count,
+            mission_ffmpeg_timeout_sec,
+        )
         print(f"mission {mission_id} started", flush=True)
         completed = subprocess.run(command, shell=True, text=True, capture_output=True, check=False)
 
