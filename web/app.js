@@ -56,14 +56,12 @@ function setTrailState(state) {
 }
 
 function updateTrailForLap(lap) {
-  const cycleLap = ((lap - 1) % 4) + 1;
-
-  if (cycleLap === 3) {
+  if (lap === 3) {
     setTrailState("is-painting");
     return;
   }
 
-  if (cycleLap === 4) {
+  if (lap === 4) {
     setTrailState("is-erasing");
     return;
   }
@@ -160,8 +158,7 @@ loadingRider?.addEventListener("animationiteration", () => {
   updateTrailForLap(loadingLap);
 });
 analyticsTrail?.addEventListener("animationend", (event) => {
-  const cycleLap = ((loadingLap - 1) % 4) + 1;
-  if (event.animationName === "trail-paint" && cycleLap === 3) {
+  if (event.animationName === "trail-paint" && loadingLap === 3) {
     setTrailState("is-painted");
   }
 });
