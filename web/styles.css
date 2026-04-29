@@ -160,10 +160,11 @@ button {
   --rider-width: min(73vw, 321px);
   --rider-height: calc(var(--rider-width) * 0.6667);
   --rider-top: calc(48.85% - 120px);
-  --trail-edge-offset: calc(var(--rider-width) * 0.82);
+  --trail-sync-delay: 460ms;
+  --trail-sync-duration: 1740ms;
   top: calc(var(--rider-top) + var(--rider-height) - 17px);
-  left: calc(-1 * var(--trail-edge-offset));
-  width: calc(100% + var(--trail-edge-offset));
+  left: 0;
+  width: 100%;
   height: 9px;
   border-radius: 999px;
   background: #7b4a21;
@@ -177,7 +178,7 @@ button {
 
 .analytics-trail.is-painting {
   opacity: 1;
-  animation: trail-paint 3.2s linear forwards;
+  animation: trail-paint var(--trail-sync-duration) linear var(--trail-sync-delay) forwards;
 }
 
 .analytics-trail.is-painted {
@@ -187,8 +188,8 @@ button {
 
 .analytics-trail.is-erasing {
   opacity: 1;
-  animation: trail-erase 3.2s linear forwards;
-  transform-origin: left center;
+  animation: trail-erase var(--trail-sync-duration) linear var(--trail-sync-delay) forwards;
+  transform-origin: right center;
 }
 
 .loading-rider {
