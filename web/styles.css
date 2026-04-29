@@ -162,7 +162,7 @@ button {
   --rider-top: calc(48.85% - 120px);
   --trail-sync-delay: 460ms;
   --trail-sync-duration: 1740ms;
-  top: calc(var(--rider-top) + var(--rider-height) - 17px);
+  top: calc(var(--rider-top) + var(--rider-height) - 64px);
   left: 0;
   width: 100%;
   height: 9px;
