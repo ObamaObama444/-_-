@@ -314,6 +314,10 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self.handle_robot_mission_complete()
             return
 
+        if parsed.path == "/api/robot/mission/event":
+            self.handle_robot_mission_event()
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_HEAD(self) -> None:
@@ -488,6 +492,29 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             points=payload.get("points"),
             target=payload.get("target"),
             error=payload.get("error"),
+        )
+        if not summary:
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Unknown mission_id"})
+            return
+
+        self.send_json(HTTPStatus.OK, {"ok": True, **summary})
+
+    def handle_robot_mission_event(self) -> None:
+        if not self.authenticate_robot():
+            return
+
+        payload = self.read_json_body(max_bytes=512_000)
+        mission_id = payload.get("mission_id")
+        if not isinstance(mission_id, str):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Expected mission_id"})
+            return
+
+        summary = update_mission_event(
+            mission_id=mission_id,
+            event=str(payload.get("event") or ""),
+            point_id=payload.get("point_id"),
+            point=payload.get("point"),
+            result=payload.get("result"),
         )
         if not summary:
             self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Unknown mission_id"})
@@ -780,6 +807,8 @@ def mission_snapshot(mission: dict[str, Any]) -> dict[str, Any]:
     return {
         "mission_id": mission.get("mission_id"),
         "status": mission.get("status", "unknown"),
+        "event": mission.get("event"),
+        "current_point": mission.get("current_point"),
         "counts": dict(mission.get("counts") or zero_class_counts()),
         "points": list(mission.get("points") or []),
         "target": mission.get("target"),
@@ -803,6 +832,8 @@ def create_mission_request(chat_id: int, user_id: int | None) -> dict[str, Any]:
             "points": [],
             "target": None,
             "error": None,
+            "event": "waiting",
+            "current_point": None,
             "created_at": time.time(),
         }
         MISSION_REQUESTS[mission_id] = mission
@@ -825,6 +856,7 @@ def claim_mission_request(timeout_sec: float) -> dict[str, Any] | None:
                     continue
 
                 mission["status"] = "assigned"
+                mission["event"] = "assigned"
                 mission["assigned_at"] = time.time()
                 logging.info("Assigned rover mission %s", mission_id)
                 return {
@@ -901,6 +933,51 @@ def update_mission_point_result(
         if mission.get("status") in {"waiting", "assigned"}:
             mission["status"] = "running"
         mission["updated_at"] = time.time()
+        MISSION_CONDITION.notify_all()
+        return mission_snapshot(mission)
+
+
+def update_mission_event(
+    mission_id: str,
+    event: str,
+    point_id: Any = None,
+    point: Any = None,
+    result: Any = None,
+) -> dict[str, Any] | None:
+    with MISSION_CONDITION:
+        mission = MISSION_REQUESTS.get(mission_id)
+        if not mission:
+            return None
+
+        clean_event = event.strip()[:240] if event else "running"
+        mission["event"] = clean_event
+        mission["updated_at"] = time.time()
+
+        if mission.get("status") in {"waiting", "assigned"}:
+            mission["status"] = "running"
+
+        if isinstance(point_id, str) and point_id:
+            mission["current_point"] = point_id
+
+        if isinstance(result, dict) and isinstance(point_id, str) and point_id:
+            point_payload = point if isinstance(point, dict) else {}
+            normalized = normalize_mission_point(point_id, point_payload, result)
+            if "error" in result:
+                normalized["error"] = str(result.get("error"))
+
+            existing_points = list(mission.get("points") or [])
+            replaced = False
+            for index, current in enumerate(existing_points):
+                if current.get("point_id") == point_id:
+                    existing_points[index] = normalized
+                    replaced = True
+                    break
+            if not replaced:
+                existing_points.append(normalized)
+
+            mission["points"] = existing_points
+            mission["counts"] = recompute_mission_counts(existing_points)
+
         MISSION_CONDITION.notify_all()
         return mission_snapshot(mission)
 

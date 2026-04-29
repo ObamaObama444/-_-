@@ -62,6 +62,7 @@ function pointProgress(status = {}) {
 
 function updateLoadingStatus(status = {}) {
   const state = status.status || "waiting";
+  const currentPoint = status.current_point ? ` ${status.current_point}` : "";
   if (state === "waiting") {
     setText(missionStatusElement, "Ждём робота");
     return;
@@ -71,7 +72,7 @@ function updateLoadingStatus(status = {}) {
     return;
   }
   if (state === "running") {
-    setText(missionStatusElement, `Точек: ${pointProgress(status)}`);
+    setText(missionStatusElement, `Точек: ${pointProgress(status)}${currentPoint}`);
     return;
   }
   if (state === "completed") {
