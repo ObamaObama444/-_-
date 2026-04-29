@@ -1,6 +1,8 @@
-const ANALYTICS_DURATION_MS = 15000;
 const WELCOME_DURATION_MS = 2400;
 const START_API_PATH = "/api/start";
+const MISSION_STATUS_API_PATH = "/api/mission/status";
+const MISSION_POLL_INTERVAL_MS = 2000;
+const MISSION_MAX_WAIT_MS = 30 * 60 * 1000;
 
 const screens = {
   welcome: document.querySelector('[data-screen="welcome"]'),
@@ -9,6 +11,7 @@ const screens = {
   result: document.querySelector('[data-screen="result"]'),
 };
 let started = false;
+let missionStartedAt = 0;
 
 function setupTelegram() {
   const webApp = window.Telegram?.WebApp;
@@ -29,7 +32,19 @@ function showScreen(name) {
   }
 }
 
-async function triggerRobotSnapshot() {
+function formatCount(value) {
+  const number = Number.isFinite(Number(value)) ? Number(value) : 0;
+  return String(Math.max(0, Math.trunc(number))).padStart(2, "0");
+}
+
+function updateCounts(counts = {}) {
+  document.querySelectorAll("[data-count]").forEach((element) => {
+    const key = element.dataset.count;
+    element.textContent = formatCount(counts[key]);
+  });
+}
+
+async function startMission() {
   const webApp = window.Telegram?.WebApp;
   const payload = {
     initData: webApp?.initData ?? "",
@@ -49,22 +64,59 @@ async function triggerRobotSnapshot() {
   return response.json();
 }
 
-function startAnalytics() {
+async function fetchMissionStatus(missionId) {
+  const url = `${MISSION_STATUS_API_PATH}?mission_id=${encodeURIComponent(missionId)}`;
+  const response = await fetch(url, { method: "GET" });
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(details || `Status request failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+function wait(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function pollMissionUntilFinished(missionId) {
+  while (Date.now() - missionStartedAt < MISSION_MAX_WAIT_MS) {
+    const status = await fetchMissionStatus(missionId);
+    updateCounts(status.counts);
+
+    if (status.status === "completed" || status.status === "failed") {
+      return status;
+    }
+
+    await wait(MISSION_POLL_INTERVAL_MS);
+  }
+
+  throw new Error("Mission timed out");
+}
+
+async function startAnalytics() {
   if (started) {
     return;
   }
   started = true;
+  missionStartedAt = Date.now();
+  updateCounts();
 
   showScreen("loading");
 
-  triggerRobotSnapshot()
-    .then(() => window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred?.("success"))
-    .catch((error) => {
-      console.error("Failed to request robot screenshot:", error);
-      window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred?.("error");
-    });
-
-  window.setTimeout(() => showScreen("result"), ANALYTICS_DURATION_MS);
+  try {
+    const mission = await startMission();
+    updateCounts(mission.counts);
+    const finished = await pollMissionUntilFinished(mission.mission_id);
+    updateCounts(finished.counts);
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred?.(
+      finished.status === "completed" ? "success" : "error",
+    );
+  } catch (error) {
+    console.error("Failed to run rover mission:", error);
+    window.Telegram?.WebApp?.HapticFeedback?.notificationOccurred?.("error");
+  } finally {
+    showScreen("result");
+  }
 }
 
 setupTelegram();

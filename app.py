@@ -32,9 +32,12 @@ DEFAULT_ROBOT_CAPTURE_WAIT_TIMEOUT_SEC = 30
 DEFAULT_ROBOT_CAPTURE_POLL_TIMEOUT_SEC = 25
 DEFAULT_ROBOT_CAPTURE_MAX_BODY_BYTES = 8_000_000
 DEFAULT_ROBOT_MISSION_MAX_BODY_BYTES = 50_000_000
+DEFAULT_ROBOT_MISSION_POLL_TIMEOUT_SEC = 25
+DEFAULT_ROBOT_MISSION_MAX_AGE_SEC = 6 * 60 * 60
 DEFAULT_BUBA_GATE_TIMEOUT_SEC = 45
 DEFAULT_BUBA_GATE_KNOWN_THRESHOLD = 0.70
 DEFAULT_BUBA_TIMEOUT_SEC = 90
+TARGET_CLASS_NAMES = ("apple", "car", "donut", "motorcycle")
 
 CHAT_BINDINGS_BY_USER_ID: dict[int, int] = {}
 LAST_KNOWN_CHAT_ID: int | None = None
@@ -44,6 +47,9 @@ LATEST_ROBOT_FRAME_LOCK = threading.Lock()
 CAPTURE_CONDITION = threading.Condition()
 CAPTURE_REQUESTS: dict[str, dict[str, Any]] = {}
 CAPTURE_QUEUE: list[str] = []
+MISSION_CONDITION = threading.Condition()
+MISSION_REQUESTS: dict[str, dict[str, Any]] = {}
+MISSION_QUEUE: list[str] = []
 
 
 def load_env(path: Path = BASE_DIR / ".env") -> None:
@@ -255,6 +261,11 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self.send_health()
             return
 
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/mission/status":
+            self.handle_mission_status(parsed)
+            return
+
         self.serve_file_for_path()
 
     def do_POST(self) -> None:
@@ -279,6 +290,14 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             self.handle_robot_mission_classify_point()
             return
 
+        if parsed.path == "/api/robot/mission/next":
+            self.handle_robot_mission_next()
+            return
+
+        if parsed.path == "/api/robot/mission/complete":
+            self.handle_robot_mission_complete()
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_HEAD(self) -> None:
@@ -299,6 +318,7 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
                 "robot_frame": robot_frame_age_sec is not None,
                 "robot_frame_age_sec": robot_frame_age_sec,
                 "capture": capture_counts,
+                "mission": get_mission_counts(),
                 "buba": buba_is_configured(),
             },
             ensure_ascii=False,
@@ -423,6 +443,42 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
 
         self.send_json(HTTPStatus.OK, {"ok": True, "request_id": request_id, "frames": len(frames)})
 
+    def handle_robot_mission_next(self) -> None:
+        if not self.authenticate_robot():
+            return
+
+        timeout_sec = max(1.0, env_float("ROBOT_MISSION_POLL_TIMEOUT_SEC", DEFAULT_ROBOT_MISSION_POLL_TIMEOUT_SEC))
+        mission_payload = claim_mission_request(timeout_sec=timeout_sec)
+        if not mission_payload:
+            self.send_json(HTTPStatus.OK, {"ok": True, "idle": True})
+            return
+
+        self.send_json(HTTPStatus.OK, {"ok": True, **mission_payload})
+
+    def handle_robot_mission_complete(self) -> None:
+        if not self.authenticate_robot():
+            return
+
+        payload = self.read_json_body(max_bytes=2_000_000)
+        mission_id = payload.get("mission_id")
+        if not isinstance(mission_id, str):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "Expected mission_id"})
+            return
+
+        summary = complete_mission_request(
+            mission_id=mission_id,
+            status=str(payload.get("status") or "completed"),
+            counts=payload.get("counts"),
+            points=payload.get("points"),
+            target=payload.get("target"),
+            error=payload.get("error"),
+        )
+        if not summary:
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Unknown mission_id"})
+            return
+
+        self.send_json(HTTPStatus.OK, {"ok": True, **summary})
+
     def handle_robot_mission_classify_point(self) -> None:
         if not self.authenticate_robot():
             return
@@ -450,6 +506,15 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
                 capture_dir,
                 request_id=f"mission_{safe_path_part(mission_id)}_{safe_path_part(point_id)}",
             )
+            response_payload = {
+                "ok": True,
+                "mission_id": mission_id,
+                "point_id": point_id,
+                "point": point or {},
+                "capture_dir": str(capture_dir),
+                **summarize_report(report),
+            }
+            update_mission_point_result(mission_id, point_id, point or {}, response_payload)
         except Exception as error:
             logging.exception("Failed to classify mission point %s/%s", mission_id, point_id)
             self.send_json(
@@ -463,17 +528,7 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             )
             return
 
-        self.send_json(
-            HTTPStatus.OK,
-            {
-                "ok": True,
-                "mission_id": mission_id,
-                "point_id": point_id,
-                "point": point or {},
-                "capture_dir": str(capture_dir),
-                **summarize_report(report),
-            },
-        )
+        self.send_json(HTTPStatus.OK, response_payload)
 
     def handle_start_request(self) -> None:
         token = os.getenv("BOT_TOKEN")
@@ -499,45 +554,32 @@ class MiniAppHandler(SimpleHTTPRequestHandler):
             )
             return
 
-        frame_count = max(1, env_int("ROBOT_CAPTURE_FRAME_COUNT", DEFAULT_ROBOT_CAPTURE_FRAME_COUNT))
-        wait_timeout_sec = max(2.0, env_float("ROBOT_CAPTURE_WAIT_TIMEOUT_SEC", DEFAULT_ROBOT_CAPTURE_WAIT_TIMEOUT_SEC))
-        request_id = create_capture_request(frame_count=frame_count)
-
-        try:
-            capture = wait_for_capture_request(request_id, timeout_sec=wait_timeout_sec)
-            report = run_buba_inference(capture["capture_dir"], request_id=request_id)
-            message = format_analysis_message(report)
-            response = telegram_request(
-                token=token,
-                method="sendMessage",
-                payload={"chat_id": chat_id, "text": message},
-            )
-        except Exception as error:
-            logging.exception("Failed to capture robot frames and run analysis")
-            notify_text = f"Не удалось выполнить анализ: {error}"
-            try:
-                telegram_request(token=token, method="sendMessage", payload={"chat_id": chat_id, "text": notify_text})
-            except Exception:
-                logging.exception("Failed to notify Telegram about analysis error")
-            self.send_json(
-                HTTPStatus.BAD_GATEWAY,
-                {"ok": False, "request_id": request_id, "error": notify_text},
-            )
-            return
-
-        if not response.get("ok"):
-            self.send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "request_id": request_id, "error": "Telegram sendMessage failed"})
-            return
+        mission = create_mission_request(chat_id=chat_id, user_id=user_id)
 
         self.send_json(
             HTTPStatus.OK,
             {
                 "ok": True,
                 "chat_id": chat_id,
-                "request_id": request_id,
-                "result": summarize_report(report),
+                **mission_snapshot(mission),
             },
         )
+
+    def handle_mission_status(self, parsed: urllib.parse.ParseResult) -> None:
+        params = urllib.parse.parse_qs(parsed.query)
+        mission_id = (params.get("mission_id") or [""])[0]
+        if not mission_id:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "mission_id is required"})
+            return
+
+        with MISSION_CONDITION:
+            mission = MISSION_REQUESTS.get(mission_id)
+            if not mission:
+                self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Mission not found"})
+                return
+            payload = mission_snapshot(mission)
+
+        self.send_json(HTTPStatus.OK, {"ok": True, **payload})
 
     def serve_file_for_path(self, head_only: bool = False) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -698,6 +740,240 @@ def get_capture_counts() -> dict[str, int]:
             status = str(request.get("status", "unknown"))
             counts[status] = counts.get(status, 0) + 1
         return counts
+
+
+def zero_class_counts() -> dict[str, int]:
+    return {class_name: 0 for class_name in TARGET_CLASS_NAMES}
+
+
+def cleanup_old_mission_requests(max_age_sec: int | None = None) -> None:
+    max_age = max_age_sec or env_int("ROBOT_MISSION_MAX_AGE_SEC", DEFAULT_ROBOT_MISSION_MAX_AGE_SEC)
+    now = time.time()
+    stale_ids = [
+        mission_id
+        for mission_id, mission in MISSION_REQUESTS.items()
+        if now - float(mission.get("created_at", now)) > max_age
+    ]
+    for mission_id in stale_ids:
+        MISSION_REQUESTS.pop(mission_id, None)
+        if mission_id in MISSION_QUEUE:
+            MISSION_QUEUE.remove(mission_id)
+
+
+def mission_snapshot(mission: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "mission_id": mission.get("mission_id"),
+        "status": mission.get("status", "unknown"),
+        "counts": dict(mission.get("counts") or zero_class_counts()),
+        "points": list(mission.get("points") or []),
+        "target": mission.get("target"),
+        "error": mission.get("error"),
+        "created_at": mission.get("created_at"),
+        "assigned_at": mission.get("assigned_at"),
+        "completed_at": mission.get("completed_at"),
+    }
+
+
+def create_mission_request(chat_id: int, user_id: int | None) -> dict[str, Any]:
+    mission_id = "mission_" + uuid.uuid4().hex
+    with MISSION_CONDITION:
+        cleanup_old_mission_requests()
+        mission = {
+            "mission_id": mission_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "status": "waiting",
+            "counts": zero_class_counts(),
+            "points": [],
+            "target": None,
+            "error": None,
+            "created_at": time.time(),
+        }
+        MISSION_REQUESTS[mission_id] = mission
+        MISSION_QUEUE.append(mission_id)
+        MISSION_CONDITION.notify_all()
+
+    logging.info("Created rover mission %s for chat %s", mission_id, chat_id)
+    return mission
+
+
+def claim_mission_request(timeout_sec: float) -> dict[str, Any] | None:
+    deadline = time.time() + timeout_sec
+    with MISSION_CONDITION:
+        while True:
+            cleanup_old_mission_requests()
+            while MISSION_QUEUE:
+                mission_id = MISSION_QUEUE.pop(0)
+                mission = MISSION_REQUESTS.get(mission_id)
+                if not mission or mission.get("status") != "waiting":
+                    continue
+
+                mission["status"] = "assigned"
+                mission["assigned_at"] = time.time()
+                logging.info("Assigned rover mission %s", mission_id)
+                return {
+                    "mission_id": mission_id,
+                    "status": "assigned",
+                }
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            MISSION_CONDITION.wait(timeout=remaining)
+
+
+def normalize_mission_point(point_id: str, point: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    class_name = result.get("final_class")
+    status = result.get("status")
+    counted = status == "ok" and class_name in TARGET_CLASS_NAMES
+    normalized: dict[str, Any] = {
+        "point_id": point_id,
+        "class_name": class_name,
+        "confidence": result.get("confidence"),
+        "status": status,
+        "gate_status": result.get("gate_status"),
+        "gate_frames_passed": result.get("gate_frames_passed"),
+        "frames_total": result.get("frames_total"),
+        "frames_valid": result.get("frames_valid"),
+        "capture_dir": result.get("capture_dir"),
+        "report_path": result.get("report_path"),
+        "gate_report_path": result.get("gate_report_path"),
+        "counted": counted,
+    }
+
+    for key in ("x", "y", "yaw"):
+        value = point.get(key)
+        if isinstance(value, (int, float)):
+            normalized[key] = float(value)
+
+    return normalized
+
+
+def recompute_mission_counts(points: list[dict[str, Any]]) -> dict[str, int]:
+    counts = zero_class_counts()
+    for point in points:
+        class_name = point.get("class_name")
+        if point.get("status") == "ok" and class_name in counts:
+            counts[str(class_name)] += 1
+    return counts
+
+
+def update_mission_point_result(
+    mission_id: str,
+    point_id: str,
+    point: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    with MISSION_CONDITION:
+        mission = MISSION_REQUESTS.get(mission_id)
+        if not mission:
+            return None
+
+        normalized = normalize_mission_point(point_id, point, result)
+        existing_points = list(mission.get("points") or [])
+        replaced = False
+        for index, current in enumerate(existing_points):
+            if current.get("point_id") == point_id:
+                existing_points[index] = normalized
+                replaced = True
+                break
+        if not replaced:
+            existing_points.append(normalized)
+
+        mission["points"] = existing_points
+        mission["counts"] = recompute_mission_counts(existing_points)
+        if mission.get("status") in {"waiting", "assigned"}:
+            mission["status"] = "running"
+        mission["updated_at"] = time.time()
+        MISSION_CONDITION.notify_all()
+        return mission_snapshot(mission)
+
+
+def complete_mission_request(
+    mission_id: str,
+    status: str,
+    counts: Any,
+    points: Any,
+    target: Any,
+    error: Any,
+) -> dict[str, Any] | None:
+    with MISSION_CONDITION:
+        mission = MISSION_REQUESTS.get(mission_id)
+        if not mission:
+            return None
+
+        final_points = points if isinstance(points, list) else mission.get("points") or []
+        mission["points"] = final_points
+        if isinstance(counts, dict):
+            merged_counts = zero_class_counts()
+            for key, value in counts.items():
+                if key in merged_counts:
+                    try:
+                        merged_counts[key] = int(value)
+                    except (TypeError, ValueError):
+                        merged_counts[key] = 0
+            mission["counts"] = merged_counts
+        else:
+            mission["counts"] = recompute_mission_counts(final_points)
+
+        mission["target"] = target if isinstance(target, dict) else target
+        mission["error"] = str(error) if error else None
+        mission["status"] = "completed" if status in {"completed", "ok", "success"} else "failed"
+        mission["completed_at"] = time.time()
+        MISSION_CONDITION.notify_all()
+        summary = mission_snapshot(mission)
+
+    maybe_send_mission_telegram_summary(summary)
+    return summary
+
+
+def get_mission_counts() -> dict[str, int]:
+    with MISSION_CONDITION:
+        counts: dict[str, int] = {}
+        for mission in MISSION_REQUESTS.values():
+            status = str(mission.get("status", "unknown"))
+            counts[status] = counts.get(status, 0) + 1
+        return counts
+
+
+def maybe_send_mission_telegram_summary(summary: dict[str, Any]) -> None:
+    if os.getenv("DISABLE_BOT") == "1":
+        return
+
+    token = os.getenv("BOT_TOKEN")
+    mission_id = summary.get("mission_id")
+    with MISSION_CONDITION:
+        mission = MISSION_REQUESTS.get(str(mission_id))
+        chat_id = mission.get("chat_id") if mission else None
+
+    if not token or not isinstance(chat_id, int):
+        return
+
+    try:
+        telegram_request(
+            token=token,
+            method="sendMessage",
+            payload={"chat_id": chat_id, "text": format_mission_summary_message(summary)},
+        )
+    except Exception:
+        logging.exception("Failed to send Telegram mission summary")
+
+
+def format_mission_summary_message(summary: dict[str, Any]) -> str:
+    counts = summary.get("counts") if isinstance(summary.get("counts"), dict) else {}
+    status = str(summary.get("status") or "unknown")
+    lines = [
+        "Маршрут завершён." if status == "completed" else "Маршрут завершился с ошибкой.",
+        "Итого:",
+        f"мотоциклы: {int(counts.get('motorcycle') or 0)}",
+        f"машинка: {int(counts.get('car') or 0)}",
+        f"пончики: {int(counts.get('donut') or 0)}",
+        f"яблоки: {int(counts.get('apple') or 0)}",
+    ]
+    error = summary.get("error")
+    if error:
+        lines.append(f"Ошибка: {error}")
+    return "\n".join(lines)
 
 
 def save_capture_frames(request_id: str, frames: list[Any]) -> Path:
