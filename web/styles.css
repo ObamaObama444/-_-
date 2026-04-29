@@ -81,18 +81,10 @@ button {
 
 .welcome-ellipse {
   z-index: 1;
-  top: 31%;
-  left: 5.8%;
-  width: 207.8%;
-  height: auto;
-}
-
-.welcome-vector {
-  z-index: 2;
-  top: 38.4%;
-  left: 2.7%;
-  width: 110.5%;
-  height: auto;
+  top: 30.8%;
+  left: 10%;
+  width: 165%;
+  height: 96%;
 }
 
 .welcome-main {
@@ -110,7 +102,7 @@ button {
 
 .start-ellipse {
   z-index: 1;
-  top: 44.2%;
+  top: 39.8%;
   left: 15.2%;
   width: 69.7%;
   height: auto;
@@ -118,7 +110,7 @@ button {
 
 .start-main {
   z-index: 2;
-  top: 31.3%;
+  top: 25.7%;
   left: 16.35%;
   width: 67.3%;
   height: auto;
@@ -127,8 +119,8 @@ button {
 .start-button {
   position: absolute;
   z-index: 3;
-  top: 58.7%;
-  left: 14%;
+  top: 56.8%;
+  left: 50%;
   width: 72%;
   height: 62px;
   border: 0;
@@ -141,6 +133,7 @@ button {
   font-weight: 400;
   line-height: 1;
   letter-spacing: 0;
+  transform: translateX(-50%);
   transition:
     transform 160ms ease,
     filter 160ms ease;
@@ -148,7 +141,7 @@ button {
 }
 
 .start-button:active {
-  transform: scale(0.985);
+  transform: translateX(-50%) scale(0.985);
   filter: brightness(0.96);
 }
 
@@ -167,12 +160,12 @@ button {
   left: 0;
   width: min(73vw, 321px);
   height: auto;
-  animation: ride-across 15s linear forwards;
+  animation: ride-across 3.2s linear infinite;
 }
 
 .loading-title {
   position: absolute;
-  top: 57%;
+  top: 62%;
   left: 50%;
   margin: 0;
   transform: translateX(-50%);
@@ -184,17 +177,33 @@ button {
   white-space: nowrap;
 }
 
+.screen-result {
+  --stats-card-left: 14%;
+  --stats-card-width: 72%;
+}
+
+.screen-result::before {
+  position: absolute;
+  z-index: 1;
+  top: 23.15%;
+  left: var(--stats-card-left);
+  width: var(--stats-card-width);
+  height: 439px;
+  border-radius: 20px;
+  background: #ffffff;
+  content: "";
+}
+
 .stats-card {
   position: absolute;
-  z-index: 3;
+  z-index: 4;
   top: 23.15%;
-  left: 14%;
-  width: 72%;
+  left: var(--stats-card-left);
+  width: var(--stats-card-width);
   min-height: 439px;
   padding: 35px 25px 32px;
   overflow: hidden;
   color: var(--bg);
-  background: #ffffff;
   border-radius: 20px;
 }
 
@@ -231,17 +240,9 @@ button {
   margin: 0;
 }
 
-.result-burst {
-  z-index: 1;
-  top: 43.4%;
-  left: -36.5%;
-  width: 101%;
-  height: auto;
-}
-
 .result-rover {
-  z-index: 2;
-  top: 36.1%;
+  z-index: 3;
+  top: 39%;
   left: -37.6%;
   width: 136%;
   height: auto;
@@ -262,15 +263,11 @@ button {
 
 @keyframes ride-across {
   0% {
-    transform: translateX(-50%);
-  }
-
-  45% {
-    transform: translateX(calc((min(100vw, 440px) - min(73vw, 321px)) / 2));
+    transform: translateX(calc(-100% - 24px));
   }
 
   100% {
-    transform: translateX(calc(min(100vw, 440px) + 18%));
+    transform: translateX(calc(min(100vw, 440px) + 24px));
   }
 }
 
@@ -281,9 +278,9 @@ button {
 }
 
 @media (max-width: 360px) {
-  .stats-card {
-    left: 10%;
-    width: 80%;
+  .screen-result {
+    --stats-card-left: 10%;
+    --stats-card-width: 80%;
   }
 
   .stats-row {
