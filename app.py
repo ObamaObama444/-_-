@@ -34,6 +34,7 @@ DEFAULT_ROBOT_CAPTURE_MAX_BODY_BYTES = 8_000_000
 DEFAULT_ROBOT_MISSION_MAX_BODY_BYTES = 50_000_000
 DEFAULT_ROBOT_MISSION_POLL_TIMEOUT_SEC = 25
 DEFAULT_ROBOT_MISSION_MAX_AGE_SEC = 6 * 60 * 60
+DEFAULT_BUBA_GATE_ENABLED = True
 DEFAULT_BUBA_GATE_TIMEOUT_SEC = 45
 DEFAULT_BUBA_GATE_KNOWN_THRESHOLD = 0.70
 DEFAULT_BUBA_TIMEOUT_SEC = 90
@@ -87,6 +88,21 @@ def env_float(name: str, default: float) -> float:
     except ValueError:
         logging.warning("%s must be a number, using %s", name, default)
         return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+
+    logging.warning("%s must be boolean-like, using %s", name, default)
+    return default
 
 
 def telegram_request(token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1067,17 +1083,33 @@ def save_mission_frames(mission_id: str, point_id: str, frames: list[Any]) -> Pa
 
 def buba_is_configured() -> bool:
     buba_dir = Path(os.getenv("BUBA_DIR", "/opt/apps/buba"))
-    return (
+    burst_configured = (
         buba_dir.exists()
         and (buba_dir / ".venv/bin/python").exists()
-        and (buba_dir / "scripts/infer_gate5.py").exists()
         and (buba_dir / "scripts/infer_burst.py").exists()
-        and (buba_dir / "outputs_gate5/checkpoints/best.pt").exists()
         and (buba_dir / "outputs_swin_burst/checkpoints/best.pt").exists()
+    )
+    if not burst_configured:
+        return False
+
+    if not env_bool("BUBA_GATE_ENABLED", DEFAULT_BUBA_GATE_ENABLED):
+        return True
+
+    return (
+        (buba_dir / "scripts/infer_gate5.py").exists()
+        and (buba_dir / "outputs_gate5/checkpoints/best.pt").exists()
     )
 
 
 def run_buba_inference(capture_dir: Path, request_id: str) -> dict[str, Any]:
+    if not env_bool("BUBA_GATE_ENABLED", DEFAULT_BUBA_GATE_ENABLED):
+        burst_report = run_buba_burst_inference(capture_dir, request_id=request_id)
+        burst_report["gate_status"] = "disabled"
+        burst_report["gate_frames_passed"] = None
+        burst_report["gate_known_ratio"] = None
+        burst_report["gate_report_path"] = None
+        return burst_report
+
     gate_report = run_buba_gate_inference(capture_dir, request_id=request_id)
     if not gate_allows_big_model(gate_report):
         return build_unknown_gate_report(gate_report)
