@@ -18,6 +18,12 @@ MISSION_POINTS_HOST="${MISSION_POINTS_HOST:-$ROVER_REPO/проезд/sticker_poi
 MISSION_DWELL_SEC="${MISSION_DWELL_SEC:-5.0}"
 MISSION_MIN_FRAME_COUNT="${MISSION_MIN_FRAME_COUNT:-4}"
 MISSION_FFMPEG_TIMEOUT_SEC="${MISSION_FFMPEG_TIMEOUT_SEC:-45}"
+MISSION_PREPARE_LOCALIZATION="${MISSION_PREPARE_LOCALIZATION:-1}"
+MISSION_MAP_FILE="${MISSION_MAP_FILE:-/root/maps/labyrint.yaml}"
+MISSION_START_X="${MISSION_START_X:--1.123}"
+MISSION_START_Y="${MISSION_START_Y:-2.226}"
+MISSION_START_QZ="${MISSION_START_QZ:-0.0}"
+MISSION_START_QW="${MISSION_START_QW:-1.0}"
 
 if [ -d "$ROVER_REPO/.git" ]; then
   git -C "$ROVER_REPO" pull --ff-only origin main || echo "warning: could not update $ROVER_REPO" >&2
@@ -34,6 +40,11 @@ docker cp "$MISSION_POINTS_HOST" "$ROS_CONTAINER:/src/maps/sticker_points.yaml"
 docker exec "$ROS_CONTAINER" chmod +x /src/scripts/drive_scan_classify_mission.py
 docker exec "$ROS_CONTAINER" bash -lc \
   "grep -q '111.88.243.193 www.adolanna.ru adolanna.ru' /etc/hosts || echo '111.88.243.193 www.adolanna.ru adolanna.ru' >> /etc/hosts"
+
+if [ "$MISSION_PREPARE_LOCALIZATION" != "0" ]; then
+  docker exec "$ROS_CONTAINER" bash -ic \
+    "/root/prep_route.sh '$MISSION_MAP_FILE' '$MISSION_START_X' '$MISSION_START_Y' '$MISSION_START_QZ' '$MISSION_START_QW'"
+fi
 
 docker exec \
   -e MISSION_ID="$MISSION_ID" \
