@@ -160,9 +160,10 @@ button {
   --rider-width: min(73vw, 321px);
   --rider-height: calc(var(--rider-width) * 0.6667);
   --rider-top: calc(48.85% - 120px);
+  --trail-edge-offset: calc(var(--rider-width) * 0.82);
   top: calc(var(--rider-top) + var(--rider-height) - 17px);
-  left: 0;
-  width: 100%;
+  left: calc(-1 * var(--trail-edge-offset));
+  width: calc(100% + var(--trail-edge-offset));
   height: 9px;
   border-radius: 999px;
   background: #7b4a21;
@@ -187,7 +188,7 @@ button {
 .analytics-trail.is-erasing {
   opacity: 1;
   animation: trail-erase 3.2s linear forwards;
-  transform-origin: right center;
+  transform-origin: left center;
 }
 
 .loading-rider {
