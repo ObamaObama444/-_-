@@ -154,6 +154,39 @@ button {
   background: var(--yellow);
 }
 
+.analytics-trail {
+  position: absolute;
+  z-index: 1;
+  top: calc(48.85% + 4px);
+  left: 0;
+  width: 100%;
+  height: 14px;
+  border-radius: 999px;
+  background: #7b4a21;
+  box-shadow:
+    inset 0 2px 0 rgb(255 255 255 / 0.14),
+    inset 0 -2px 0 rgb(0 0 0 / 0.16);
+  opacity: 0;
+  transform: scaleX(0);
+  transform-origin: left center;
+}
+
+.analytics-trail.is-painting {
+  opacity: 1;
+  animation: trail-paint 3.2s linear forwards;
+}
+
+.analytics-trail.is-painted {
+  opacity: 1;
+  transform: scaleX(1);
+}
+
+.analytics-trail.is-erasing {
+  opacity: 1;
+  animation: trail-erase 3.2s linear forwards;
+  transform-origin: right center;
+}
+
 .loading-rider {
   z-index: 2;
   top: calc(48.85% - 120px);
@@ -268,6 +301,26 @@ button {
 
   100% {
     transform: translateX(calc(min(100vw, 440px) + 24px));
+  }
+}
+
+@keyframes trail-paint {
+  0% {
+    transform: scaleX(0);
+  }
+
+  100% {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes trail-erase {
+  0% {
+    transform: scaleX(1);
+  }
+
+  100% {
+    transform: scaleX(0);
   }
 }
 
