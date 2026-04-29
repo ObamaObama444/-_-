@@ -12,10 +12,6 @@ const screens = {
 };
 let started = false;
 let missionStartedAt = 0;
-let loadingLap = 1;
-
-const loadingRider = document.querySelector(".loading-rider");
-const analyticsTrail = document.querySelector(".analytics-trail");
 
 function setupTelegram() {
   const webApp = window.Telegram?.WebApp;
@@ -46,32 +42,6 @@ function updateCounts(counts = {}) {
     const key = element.dataset.count;
     element.textContent = formatCount(counts[key]);
   });
-}
-
-function setTrailState(state) {
-  analyticsTrail?.classList.remove("is-painting", "is-painted", "is-erasing");
-  if (state) {
-    analyticsTrail?.classList.add(state);
-  }
-}
-
-function updateTrailForLap(lap) {
-  if (lap === 3) {
-    setTrailState("is-painting");
-    return;
-  }
-
-  if (lap === 4) {
-    setTrailState("is-erasing");
-    return;
-  }
-
-  setTrailState(null);
-}
-
-function resetLoadingTrail() {
-  loadingLap = 1;
-  setTrailState(null);
 }
 
 async function startMission() {
@@ -130,7 +100,6 @@ async function startAnalytics() {
   started = true;
   missionStartedAt = Date.now();
   updateCounts();
-  resetLoadingTrail();
 
   showScreen("loading");
 
@@ -153,12 +122,3 @@ async function startAnalytics() {
 setupTelegram();
 window.setTimeout(() => showScreen("start"), WELCOME_DURATION_MS);
 document.querySelector(".start-button").addEventListener("click", startAnalytics);
-loadingRider?.addEventListener("animationiteration", () => {
-  loadingLap += 1;
-  updateTrailForLap(loadingLap);
-});
-analyticsTrail?.addEventListener("animationend", (event) => {
-  if (event.animationName === "trail-paint" && loadingLap === 3) {
-    setTrailState("is-painted");
-  }
-});
